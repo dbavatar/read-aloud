@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Read Aloud</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="page">
+    <main class="main-column">
+      <header class="hero">
+        <div>
+          <p class="eyebrow">Local TTS reader</p>
+          <h1>Read Aloud</h1>
+          <p class="subtitle">Fetch a webpage, paste text, then listen with speed controls. Runs locally via MLX on Apple Silicon.</p>
+        </div>
+        <div class="status-card" id="modelStatus">Model: loading…</div>
+      </header>
+
+      <section class="panel">
+        <label for="urlInput">Webpage URL</label>
+        <div class="row">
+          <input id="urlInput" type="url" placeholder="Page URL">
+          <button id="fetchBtn" type="button">Fetch</button>
+          <button id="openBtn" type="button" class="secondary">Open</button>
+        </div>
+        <p id="fetchMeta" class="meta"></p>
+        <p id="fetchWarning" class="warning hidden"></p>
+      </section>
+
+      <section class="panel text-panel">
+        <div class="row between">
+          <label for="textInput">Text to read</label>
+          <div class="row compact">
+            <button id="editModeBtn" type="button" class="secondary small hidden">Edit text</button>
+            <button id="pasteBtn" type="button" class="secondary small">Paste clipboard</button>
+          </div>
+        </div>
+        <div class="text-shell">
+          <textarea id="textInput" placeholder="Paste article text here, or fetch a URL above. Click where you want to start reading."></textarea>
+          <div id="readingView" class="reading-view hidden" aria-live="polite"></div>
+        </div>
+        <p id="textMeta" class="meta">0 characters · Click in the text to set start position</p>
+      </section>
+
+      <section class="panel model-panel">
+        <div class="row between">
+          <label for="modelSelect">TTS model</label>
+          <span class="backend-pill" id="backendPill">MLX</span>
+        </div>
+        <div class="row">
+          <select id="modelSelect"></select>
+          <button id="downloadModelBtn" type="button" class="secondary">Download</button>
+        </div>
+        <p id="modelMeta" class="meta"></p>
+        <p id="modelWarning" class="warning hidden"></p>
+      </section>
+    </main>
+
+    <aside class="control-sidebar panel">
+      <h2 class="sidebar-title">Playback</h2>
+
+      <div class="control-group">
+        <label for="voiceSelect">Voice</label>
+        <select id="voiceSelect"></select>
+      </div>
+
+      <div class="control-group speed-group">
+        <label for="speedSlider">Speed <span id="speedValue">2.0x</span></label>
+        <input id="speedSlider" type="range" min="0.5" max="3" step="0.1" value="2">
+        <div class="speed-presets">
+          <button type="button" data-speed="1">1x</button>
+          <button type="button" data-speed="1.5">1.5x</button>
+          <button type="button" data-speed="2">2x</button>
+          <button type="button" data-speed="2.5">2.5x</button>
+        </div>
+      </div>
+
+      <label class="toggle-row">
+        <input id="steadyReadingToggle" type="checkbox" checked>
+        <span>Steady tone</span>
+      </label>
+      <p class="sidebar-hint">Keeps a calm, consistent narrator voice across sections.</p>
+
+      <div class="control-group transport">
+        <button id="playBtn" type="button" class="primary">Play</button>
+        <button id="pauseBtn" type="button" class="secondary" disabled>Pause</button>
+        <button id="stopBtn" type="button" class="secondary" disabled>Stop</button>
+      </div>
+
+      <div class="progress-panel">
+        <div class="progress-top">
+          <span id="playbackStatus">Ready</span>
+          <span id="chunkCounter"></span>
+        </div>
+        <div class="progress-bar">
+          <div id="progressFill"></div>
+        </div>
+        <p id="chunkPipeline" class="chunk-pipeline hidden"></p>
+        <div class="chunk-legend" aria-hidden="true">
+          <span class="legend-item"><span class="legend-dot generating"></span>Generating</span>
+          <span class="legend-item"><span class="legend-dot ready"></span>Ready</span>
+          <span class="legend-item"><span class="legend-dot playing"></span>Playing</span>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
