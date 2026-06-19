@@ -6,3 +6,5 @@ venv/
 *.wav
 .env
 .env.*
+scripts/node_modules/
+=*

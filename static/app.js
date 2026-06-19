@@ -23,6 +23,8 @@ const playbackStatus = document.getElementById("playbackStatus");
 const chunkCounter = document.getElementById("chunkCounter");
 const progressFill = document.getElementById("progressFill");
 const modelStatus = document.getElementById("modelStatus");
+const buildInfo = document.getElementById("buildInfo");
+const pageLoadedAt = new Date();
 const steadyReadingToggle = document.getElementById("steadyReadingToggle");
 const chunkPipeline = document.getElementById("chunkPipeline");
 
@@ -45,9 +47,182 @@ let modelCatalog = [];
 let statusPollTimer = null;
 let chunkStatusPollTimer = null;
 let playAllLock = false;
+let cancelActiveBlobPlayback = null;
 let blobDurationCache = new WeakMap();
 let startOffset = 0;
 let lastScrollAt = 0;
+let pendingReswitchChunk = null;
+let pendingResumeRatio = 0;
+let readingScrollLocked = false;
+let playbackReswitchActive = false;
+
+function wasPlaybackInProgress() {
+  return (
+    !!(playAllPromise || playAllLock || currentAudio) ||
+    chunkStates.some((state) => state === "playing" || state === "generating") ||
+    serverSynthesizingChunk !== null
+  );
+}
+
+function clearReadingSurface() {
+  chunkTexts = [];
+  chunkElements = [];
+  chunkStates = [];
+  chunkStarts = [];
+  readingView.innerHTML = "";
+  if (chunkPipeline) {
+    chunkPipeline.classList.add("hidden");
+  }
+}
+
+function endReadingSession() {
+  sessionId = null;
+  totalChunks = 0;
+  currentChunk = 0;
+  prefetchCache.clear();
+  clearReadingSurface();
+  updateProgress();
+  updateTextMeta();
+  showEditMode();
+}
+
+function endPlaybackReswitch() {
+  pendingReswitchChunk = null;
+  playbackReswitchActive = false;
+  readingScrollLocked = false;
+}
+
+function hasActiveReadingSession() {
+  return !!(
+    sessionId ||
+    totalChunks > 0 ||
+    chunkElements.length > 0 ||
+    playAllPromise ||
+    playAllLock ||
+    currentAudio
+  );
+}
+
+async function rebindSessionKeepingPosition(resumeChunk, savedTotalChunks) {
+  if (savedTotalChunks <= 0) {
+    return null;
+  }
+  const data = await bindNewSession(resumeChunk);
+  const chunks = data.chunks || [];
+  if (chunks.length > 0 && !chunksMatch(chunks, chunkTexts)) {
+    buildReadingView(chunks);
+    applyStartPosition(clampChunkIndex(resumeChunk));
+  }
+  clearAudioCacheStates(resumeChunk);
+  return data;
+}
+
+async function reswitchPlayback({
+  kind,
+  applyChange,
+  disablePlayBtn = false,
+} = {}) {
+  const resumeChunk = getResumeChunkIndex();
+  pendingResumeRatio = getChunkReadRatio(resumeChunk);
+  const shouldResume = wasPlaybackInProgress() && !isPaused;
+  const pausedSection =
+    Math.max(totalChunks, chunkElements.length, chunkTexts.length) > 0 ? resumeChunk + 1 : null;
+  const scrollTop = captureReadingScroll();
+  const savedTotalChunks = Math.max(totalChunks, chunkElements.length, chunkTexts.length);
+
+  pendingReswitchChunk = resumeChunk;
+  readingScrollLocked = savedTotalChunks > 0;
+  playbackReswitchActive = true;
+
+  if (disablePlayBtn) {
+    playBtn.disabled = true;
+  }
+
+  try {
+    setStatus(
+      pausedSection !== null
+        ? `Switching ${kind} (keeping position)… section ${pausedSection}`
+        : `Switching ${kind}…`,
+    );
+    await interruptPlaybackForReswitch();
+    currentChunk = clampChunkIndex(resumeChunk);
+    await applyChange({ resumeChunk, savedTotalChunks, currentChunk });
+
+    syncChunkSessionState(savedTotalChunks);
+    showReadingMode();
+    restoreReadingScroll(scrollTop);
+    if (pendingResumeRatio > 0) {
+      setChunkProgress(resumeChunk, pendingResumeRatio);
+    }
+    updateSidebarIndicators();
+
+    if (savedTotalChunks > 0 && shouldResume) {
+      readingScrollLocked = false;
+      const resumeRatio = pendingResumeRatio;
+      endPlaybackReswitch();
+      pendingResumeRatio = resumeRatio;
+      setStatus(`Resuming section ${currentChunk + 1} with new ${kind}…`);
+      void beginPlayback({ force: true, skipPositionReset: true });
+      return;
+    }
+
+    endPlaybackReswitch();
+    if (savedTotalChunks > 0) {
+      setStatus(`Ready — press Play to continue from section ${currentChunk + 1}`);
+    } else {
+      setStatus("Ready");
+    }
+  } catch (error) {
+    currentChunk = clampChunkIndex(resumeChunk);
+    syncChunkSessionState(savedTotalChunks);
+    showReadingMode();
+    restoreReadingScroll(scrollTop);
+    updateSidebarIndicators();
+    endPlaybackReswitch();
+    throw error;
+  } finally {
+    if (disablePlayBtn) {
+      playBtn.disabled = false;
+    }
+  }
+}
+
+function updateSidebarIndicators() {
+  syncChunkSessionState();
+  updateProgress();
+  updateTextMeta();
+  updateChunkPipeline();
+}
+
+function syncChunkSessionState(minChunks = 0) {
+  const domChunks = chunkElements.length;
+  if (domChunks > 0 && totalChunks === 0) {
+    totalChunks = domChunks;
+  }
+  if (minChunks > 0) {
+    totalChunks = Math.max(totalChunks, minChunks);
+  }
+  if (chunkPipeline && totalChunks > 0) {
+    chunkPipeline.classList.remove("hidden");
+  }
+}
+
+function clearAudioCacheStates(fromChunk) {
+  if (!totalChunks) {
+    return;
+  }
+  const from = clampChunkIndex(fromChunk);
+  currentChunk = from;
+  for (let index = from; index < totalChunks; index += 1) {
+    if (chunkStates[index] === "ready" || chunkStates[index] === "generating") {
+      chunkStates[index] = "pending";
+      const element = chunkElements[index];
+      if (element) {
+        element.classList.remove("audio-ready", "generating");
+      }
+    }
+  }
+}
 
 function escapeHtml(value) {
   return value
@@ -130,8 +305,29 @@ function updateTextMeta() {
   textMeta.textContent = `${count.toLocaleString()} characters · ${hint}`;
 }
 
+function captureReadingScroll() {
+  if (readingView.classList.contains("hidden")) {
+    return 0;
+  }
+  return readingView.scrollTop;
+}
+
+function restoreReadingScroll(scrollTop) {
+  if (readingView.classList.contains("hidden")) {
+    return;
+  }
+  readingView.scrollTop = scrollTop;
+  requestAnimationFrame(() => {
+    readingView.scrollTop = scrollTop;
+  });
+}
+
+function chunksMatch(left, right) {
+  return left.length === right.length && left.every((chunk, index) => chunk === right[index]);
+}
+
 function scrollChunkIntoView(element, force = false) {
-  if (!element || readingView.classList.contains("hidden")) {
+  if (readingScrollLocked || !element || readingView.classList.contains("hidden")) {
     return;
   }
   const now = Date.now();
@@ -146,6 +342,75 @@ function scrollChunkIntoView(element, force = false) {
     top: Math.max(0, top),
     behavior: force ? "auto" : "smooth",
   });
+}
+
+function getResumeChunkIndex() {
+  const playingIndex = chunkStates.findIndex((state) => state === "playing");
+  if (playingIndex >= 0) {
+    return playingIndex;
+  }
+  const generatingIndex = chunkStates.findIndex((state) => state === "generating");
+  if (generatingIndex >= 0) {
+    return generatingIndex;
+  }
+  return currentChunk;
+}
+
+function getChunkReadRatio(index) {
+  const text = chunkTexts[index] || "";
+  if (!text.length) {
+    return 0;
+  }
+
+  if (
+    currentAudio &&
+    chunkStates[index] === "playing" &&
+    Number.isFinite(currentAudio.duration) &&
+    currentAudio.duration > 0
+  ) {
+    return Math.max(0, Math.min(1, currentAudio.currentTime / currentAudio.duration));
+  }
+
+  const readLen = chunkElements[index]?.querySelector(".read-part")?.textContent?.length ?? 0;
+  if (readLen <= 0) {
+    return 0;
+  }
+  return Math.max(0, Math.min(1, readLen / text.length));
+}
+
+function getPlaybackStartRatio(chunkIndex) {
+  if (chunkIndex === currentChunk && pendingResumeRatio > 0) {
+    const ratio = pendingResumeRatio;
+    pendingResumeRatio = 0;
+    return ratio;
+  }
+  return getChunkReadRatio(chunkIndex);
+}
+
+function clampChunkIndex(index) {
+  if (!totalChunks) {
+    return 0;
+  }
+  return Math.max(0, Math.min(index, totalChunks - 1));
+}
+
+function restoreChunkPosition(index, { preserveScroll = false } = {}) {
+  if (!totalChunks) {
+    return;
+  }
+  const scrollTop = preserveScroll ? captureReadingScroll() : null;
+  currentChunk = clampChunkIndex(index);
+  showReadingMode();
+  applyStartPosition(currentChunk);
+  updateProgress();
+  updateTextMeta();
+  updateChunkPipeline();
+  if (chunkPipeline) {
+    chunkPipeline.classList.remove("hidden");
+  }
+  if (preserveScroll && scrollTop !== null) {
+    restoreReadingScroll(scrollTop);
+  }
 }
 
 function applyStartPosition(index) {
@@ -183,17 +448,18 @@ function applyStartPosition(index) {
   updateChunkPipeline();
 }
 
-function jumpToChunk(index) {
+async function jumpToChunk(index) {
   if (!totalChunks) {
     startOffset = 0;
     updateTextMeta();
     return;
   }
 
-  if (playAllPromise || currentAudio) {
-    stopPlayback();
+  if (playAllPromise || playAllLock || currentAudio) {
+    await stopPlayback();
   }
   isPaused = false;
+  pendingResumeRatio = 0;
   applyStartPosition(index);
   if (chunkElements[index]) {
     scrollChunkIntoView(chunkElements[index], true);
@@ -379,11 +645,16 @@ function showReadingMode() {
 }
 
 function showEditMode() {
+  if (playbackReswitchActive) {
+    return;
+  }
+  if (chunkElements.length > 0 || chunkTexts.length > 0) {
+    return;
+  }
   isReadingMode = false;
   textInput.classList.remove("hidden");
   readingView.classList.add("hidden");
   editModeBtn.classList.add("hidden");
-  clearReadingHighlight();
 }
 
 function buildReadingView(chunks) {
@@ -440,6 +711,9 @@ function setChunkProgress(index, ratio) {
   applyChunkClasses(element, index, clampedRatio >= 1 ? "done" : "current");
   element.innerHTML = `<span class="read-part">${readPart}</span><span class="unread-part">${unreadPart}</span>`;
   updateChunkPipeline();
+  if (clampedRatio > 0.05) {
+    readingScrollLocked = false;
+  }
   if (clampedRatio <= 0.02 || clampedRatio >= 0.98) {
     scrollChunkIntoView(element, clampedRatio <= 0.02);
   }
@@ -454,6 +728,61 @@ function markChunkDone(index) {
   element.innerHTML = escapeHtml(chunkTexts[index] || "");
 }
 
+function formatTimestamp(value) {
+  if (!value) {
+    return "unknown";
+  }
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "unknown";
+  }
+  return date.toLocaleString();
+}
+
+function updateBuildInfo(build) {
+  if (!buildInfo || !build) {
+    return;
+  }
+
+  const commitLabel = build.git_dirty ? `${build.git_commit} (dirty)` : build.git_commit;
+  const parts = [
+    build.version,
+    commitLabel,
+    `js ${build.app_js_version || "?"}`,
+    `commit ${formatTimestamp(build.git_commit_date)}`,
+    `server ${formatTimestamp(build.server_started_at)}`,
+    `page ${formatTimestamp(pageLoadedAt)}`,
+  ];
+  buildInfo.textContent = parts.join(" · ");
+  buildInfo.title = build.git_describe || build.version;
+}
+
+function formatModelSize(model) {
+  if (model.size_gb_on_disk != null) {
+    return `${Number(model.size_gb_on_disk).toFixed(2)} GB`;
+  }
+  if (model.size_gb_estimate != null) {
+    return `~${Number(model.size_gb_estimate).toFixed(2)} GB`;
+  }
+  return model.size_label || "";
+}
+
+function formatMemoryLine(data) {
+  const active = data.memory_active_gb;
+  const peak = data.memory_peak_gb;
+  if (active == null && peak == null) {
+    return "";
+  }
+  const parts = [];
+  if (active != null) {
+    parts.push(`${Number(active).toFixed(2)} GB active`);
+  }
+  if (peak != null && peak > 0) {
+    parts.push(`${Number(peak).toFixed(2)} GB peak`);
+  }
+  return parts.join(" · ");
+}
+
 function formatModelLabel(model) {
   const badge = model.backend === "mlx" ? "MLX" : model.backend.toUpperCase();
   const status =
@@ -464,11 +793,28 @@ function formatModelLabel(model) {
         : model.status === "partial"
           ? "partial"
           : "download";
-  return `${badge} · ${model.name} (${status})`;
+  const size = formatModelSize(model);
+  return `${badge} · ${model.name} · ${size} (${status})`;
 }
 
 function selectedModel() {
   return modelCatalog.find((model) => model.id === modelSelect.value) || null;
+}
+
+function updatePlaybackControls() {
+  const model = selectedModel();
+  const supportsSteady = Boolean(model?.supports_steady_reading);
+  steadyReadingToggle.disabled = !supportsSteady;
+  const steadyRow = steadyReadingToggle.closest(".toggle-row");
+  if (steadyRow) {
+    steadyRow.classList.toggle("disabled", !supportsSteady);
+  }
+  if (!supportsSteady) {
+    steadyReadingToggle.checked = false;
+  }
+
+  const singleVoice = model?.voice_type === "single";
+  voiceSelect.disabled = singleVoice;
 }
 
 function updateModelControls() {
@@ -477,7 +823,10 @@ function updateModelControls() {
     return;
   }
 
-  modelMeta.textContent = `${model.description} · ${model.size_label}`;
+  const sizeText = formatModelSize(model);
+  const sizeDetail =
+    model.size_gb_on_disk != null ? `${sizeText} on disk` : `${sizeText} download`;
+  modelMeta.textContent = `${model.description} · ${sizeDetail}`;
   backendPill.textContent = model.backend === "mlx" ? "MLX · Apple Silicon" : model.backend.toUpperCase();
 
   if (model.status === "ready") {
@@ -490,6 +839,8 @@ function updateModelControls() {
     downloadModelBtn.textContent = model.status === "partial" ? "Finish download" : "Download";
     downloadModelBtn.disabled = false;
   }
+
+  updatePlaybackControls();
 }
 
 async function loadModels() {
@@ -517,8 +868,22 @@ async function loadModelStatus() {
   const response = await fetch("/api/status");
   const data = await response.json();
 
+  const memoryLine = formatMemoryLine(data);
+  const sizeLine = data.size_gb_on_disk != null
+    ? `${Number(data.size_gb_on_disk).toFixed(2)} GB loaded`
+    : data.size_gb_estimate != null
+      ? `~${Number(data.size_gb_estimate).toFixed(2)} GB`
+      : "";
+  const detailParts = [`Ready on ${data.device}`];
+  if (sizeLine) {
+    detailParts.push(sizeLine);
+  }
+  if (memoryLine) {
+    detailParts.push(`VRAM ${memoryLine}`);
+  }
+
   if (data.ready) {
-    modelStatus.innerHTML = `<strong>${data.backend_label}</strong><br>${data.model_name}<br><span class="meta-inline">Ready on ${data.device}</span>`;
+    modelStatus.innerHTML = `<strong>${data.backend_label}</strong><br>${data.model_name}<br><span class="meta-inline">${detailParts.join(" · ")}</span>`;
     playBtn.disabled = false;
   } else if (data.loading) {
     modelStatus.innerHTML = `<strong>${data.backend_label}</strong><br>Switching model…`;
@@ -529,6 +894,7 @@ async function loadModelStatus() {
   }
 
   backendPill.textContent = `${data.backend_label || "MLX"} · Apple Silicon`;
+  updateBuildInfo(data.build);
   return data;
 }
 
@@ -542,22 +908,42 @@ async function selectCurrentModel() {
   }
 
   modelWarning.classList.add("hidden");
-  setStatus("Switching model…");
-  playBtn.disabled = true;
-
-  const response = await fetch("/api/models/select", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model_id: model.id }),
+  await reswitchPlayback({
+    kind: "model",
+    disablePlayBtn: true,
+    applyChange: async ({ resumeChunk, savedTotalChunks }) => {
+      const response = await fetch("/api/models/select", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model_id: model.id }),
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error || "Could not switch model");
+      }
+      await Promise.all([loadModels(), loadModelStatus(), loadVoices()]);
+      updatePlaybackControls();
+      await rebindSessionKeepingPosition(resumeChunk, savedTotalChunks);
+    },
   });
-  const data = await response.json();
-  if (!response.ok) {
-    throw new Error(data.error || "Could not switch model");
-  }
+}
 
-  resetSession();
-  await Promise.all([loadModels(), loadModelStatus()]);
-  setStatus("Ready");
+async function selectCurrentVoice() {
+  await reswitchPlayback({
+    kind: "voice",
+    applyChange: async ({ resumeChunk, savedTotalChunks }) => {
+      await rebindSessionKeepingPosition(resumeChunk, savedTotalChunks);
+    },
+  });
+}
+
+async function applySteadyReadingChange() {
+  await reswitchPlayback({
+    kind: "reading style",
+    applyChange: async ({ resumeChunk, savedTotalChunks }) => {
+      await rebindSessionKeepingPosition(resumeChunk, savedTotalChunks);
+    },
+  });
 }
 
 async function downloadCurrentModel() {
@@ -685,11 +1071,23 @@ async function pasteClipboard() {
   }
 }
 
-async function prepareSession(generation = playbackGeneration) {
+async function prepareSession(
+  generation = playbackGeneration,
+  startChunk = null,
+  { preserveScroll = false } = {},
+) {
   const text = getReadableText();
   if (!text) {
     throw new Error("Add some text first. If URL fetch failed, paste the article text.");
   }
+
+  const resumeAt =
+    startChunk ??
+    (totalChunks > 0 || chunkTexts.length > 0
+      ? currentChunk
+      : findChunkIndexForOffset(startOffset));
+  const hadReadingView = chunkTexts.length > 0;
+  const scrollTop = preserveScroll || hadReadingView ? captureReadingScroll() : null;
 
   const controller = new AbortController();
   const timeoutId = window.setTimeout(() => controller.abort(), 15000);
@@ -715,21 +1113,26 @@ async function prepareSession(generation = playbackGeneration) {
     throw new Error(data.error || "Could not prepare audio");
   }
 
+  const chunks = data.chunks || [];
+  const reuseView = hadReadingView && chunksMatch(chunks, chunkTexts);
+
   sessionId = data.session_id;
   totalChunks = data.chunk_count;
   chunkStarts = data.chunk_starts || [];
   prefetchCache.clear();
-  buildReadingView(data.chunks || []);
 
-  const startIndex =
-    totalChunks > 0 ? Math.min(currentChunk, data.chunk_count - 1) : findChunkIndexForOffset(startOffset);
-  currentChunk = startIndex;
-  showReadingMode();
-  applyStartPosition(startIndex);
-  if (chunkElements[startIndex]) {
+  if (!reuseView) {
+    buildReadingView(chunks);
+  }
+
+  const startIndex = clampChunkIndex(resumeAt);
+  restoreChunkPosition(startIndex, { preserveScroll: preserveScroll || reuseView });
+
+  if (scrollTop !== null) {
+    restoreReadingScroll(scrollTop);
+  } else if (!hadReadingView && chunkElements[startIndex]) {
     scrollChunkIntoView(chunkElements[startIndex], true);
   }
-  updateProgress();
   return data;
 }
 
@@ -807,6 +1210,8 @@ async function playBlob(blob, chunkIndex, generation) {
     return false;
   }
 
+  const startRatio = getPlaybackStartRatio(chunkIndex);
+
   return new Promise((resolve, reject) => {
     const url = URL.createObjectURL(blob);
     const audio = new Audio();
@@ -814,11 +1219,29 @@ async function playBlob(blob, chunkIndex, generation) {
     let rafId = 0;
     let playStartedAt = 0;
     let completed = false;
+    let endTimer = 0;
+    const clampedStart = Math.max(0, Math.min(1, startRatio));
 
     const cleanup = () => {
+      window.clearTimeout(endTimer);
       cancelAnimationFrame(rafId);
+      audio.onended = null;
       audio.ontimeupdate = null;
+      audio.onerror = null;
+      audio.pause();
       URL.revokeObjectURL(url);
+    };
+
+    const scheduleEndWatchdog = () => {
+      window.clearTimeout(endTimer);
+      const speed = playbackSpeed();
+      const remaining = (mediaDuration * (1 - clampedStart)) / speed;
+      const ms = Math.max(750, remaining * 1000 + 1000);
+      endTimer = window.setTimeout(() => {
+        if (!completed) {
+          finishChunk(isPlaybackActive(generation));
+        }
+      }, ms);
     };
 
     const getRatio = () => {
@@ -851,6 +1274,9 @@ async function playBlob(blob, chunkIndex, generation) {
         return;
       }
       completed = true;
+      if (cancelActiveBlobPlayback === finishChunk) {
+        cancelActiveBlobPlayback = null;
+      }
       cleanup();
       if (currentAudio === audio) {
         currentAudio = null;
@@ -862,11 +1288,16 @@ async function playBlob(blob, chunkIndex, generation) {
       resolve(success);
     };
 
+    cancelActiveBlobPlayback = finishChunk;
+
     audio.onended = () => {
       finishChunk(isPlaybackActive(generation));
     };
 
     audio.onerror = () => {
+      if (cancelActiveBlobPlayback === finishChunk) {
+        cancelActiveBlobPlayback = null;
+      }
       cleanup();
       if (currentAudio === audio) {
         currentAudio = null;
@@ -882,7 +1313,11 @@ async function playBlob(blob, chunkIndex, generation) {
         return;
       }
       applyAudioSpeed(audio);
-      setChunkProgress(chunkIndex, 0);
+      if (clampedStart > 0) {
+        setChunkProgress(chunkIndex, clampedStart);
+      } else if (!readingScrollLocked) {
+        setChunkProgress(chunkIndex, 0);
+      }
       playStartedAt = performance.now();
       audio
         .play()
@@ -893,10 +1328,18 @@ async function playBlob(blob, chunkIndex, generation) {
             return;
           }
           applyAudioSpeed(audio);
+          if (clampedStart > 0) {
+            audio.currentTime = clampedStart * mediaDuration;
+            setChunkProgress(chunkIndex, clampedStart);
+          }
           playStartedAt = performance.now();
+          scheduleEndWatchdog();
           rafId = requestAnimationFrame(tick);
         })
         .catch((error) => {
+          if (cancelActiveBlobPlayback === finishChunk) {
+            cancelActiveBlobPlayback = null;
+          }
           cleanup();
           reject(error);
         });
@@ -912,7 +1355,97 @@ async function playBlob(blob, chunkIndex, generation) {
   });
 }
 
-async function playAll() {
+async function runPlaybackLoop(generation, { skipPositionReset = false } = {}) {
+  if (!sessionId) {
+    setStatus("Preparing…");
+    if (chunkTexts.length > 0) {
+      await refreshSessionOnly(generation, currentChunk);
+    } else {
+      await prepareSession(generation, currentChunk, { preserveScroll: readingScrollLocked });
+    }
+    if (!isPlaybackActive(generation)) {
+      return;
+    }
+    showReadingMode();
+  } else if (!skipPositionReset && !readingScrollLocked && !playbackReswitchActive) {
+    restoreChunkPosition(currentChunk, { preserveScroll: false });
+  } else {
+    showReadingMode();
+    updateSidebarIndicators();
+  }
+
+  for (let index = currentChunk; index < totalChunks; index += 1) {
+    if (!isPlaybackActive(generation)) {
+      break;
+    }
+
+    while (isPaused && isPlaybackActive(generation)) {
+      await new Promise((resolve) => setTimeout(resolve, 120));
+    }
+    if (!isPlaybackActive(generation)) {
+      break;
+    }
+
+    setStatus(`Synthesizing chunk ${index + 1} of ${totalChunks}…`);
+    let blob;
+    try {
+      blob = await fetchChunkBlob(index, generation);
+    } catch (error) {
+      if (error.name === "AbortError" || !isPlaybackActive(generation)) {
+        break;
+      }
+      throw error;
+    }
+
+    prefetchChunk(index + 1, generation);
+
+    setStatus(`Playing chunk ${index + 1} of ${totalChunks}`);
+    let finished = false;
+    try {
+      finished = await playBlob(blob, index, generation);
+    } catch (error) {
+      if (!isPlaybackActive(generation)) {
+        break;
+      }
+      throw error;
+    }
+
+    if (!isPlaybackActive(generation)) {
+      currentChunk = index;
+      updateProgress();
+      break;
+    }
+
+    if (!finished) {
+      if (isPaused) {
+        currentChunk = index;
+        updateProgress();
+        break;
+      }
+      throw new Error(`Playback stopped unexpectedly at section ${index + 1}`);
+    }
+
+    currentChunk = index + 1;
+    updateProgress();
+  }
+
+  if (!isPlaybackActive(generation)) {
+    if (pendingReswitchChunk === null && !playbackReswitchActive) {
+      restoreChunkPosition(currentChunk);
+      setStatus("Stopped");
+    }
+    return;
+  }
+
+  if (totalChunks > 0 && currentChunk >= totalChunks) {
+    setStatus("Finished");
+    endReadingSession();
+  } else if (isPaused) {
+    setStatus("Paused");
+  }
+}
+
+async function beginPlayback({ force = false, skipPositionReset = false } = {}) {
   if (!getReadableText()) {
     fetchWarning.textContent = "Add some text first. Open the page, copy the text, and paste it here.";
     fetchWarning.classList.remove("hidden");
@@ -920,7 +1453,7 @@ async function playAll() {
     return;
   }
 
-  if (playAllPromise || playAllLock) {
+  if (!force && (playAllPromise || playAllLock)) {
     if (isPaused && playAllPromise) {
       isPaused = false;
       setStatus(`Playing chunk ${currentChunk + 1} of ${totalChunks}`);
@@ -933,126 +1466,68 @@ async function playAll() {
     return;
   }
 
-  playAllLock = true;
+  if (force && (playAllPromise || playAllLock)) {
+    playbackGeneration += 1;
+    if (cancelActiveBlobPlayback) {
+      cancelActiveBlobPlayback(false);
+      cancelActiveBlobPlayback = null;
+    }
+    abortPendingFetches();
+    if (currentAudio) {
+      detachAudio(currentAudio);
+      currentAudio = null;
+    }
+    await waitForActivePlaybackWorker();
+    playAllPromise = null;
+    playAllLock = false;
+    stopChunkStatusPoll();
+  }
+
   const generation = playbackGeneration;
   isPaused = false;
   setButtons({ playing: true, paused: false });
   startChunkStatusPoll();
+  playAllLock = true;
 
-  playAllPromise = (async () => {
-    try {
-      if (!sessionId) {
-        setStatus("Preparing…");
-        await prepareSession(generation);
-        if (!isPlaybackActive(generation)) {
-          return;
-        }
-      } else {
-        if (!isReadingMode) {
-          showReadingMode();
-        }
-        applyStartPosition(currentChunk);
-      }
-
-      for (let index = currentChunk; index < totalChunks; index += 1) {
-        if (!isPlaybackActive(generation)) {
-          break;
-        }
-
-        while (isPaused && isPlaybackActive(generation)) {
-          await new Promise((resolve) => setTimeout(resolve, 120));
-        }
-        if (!isPlaybackActive(generation)) {
-          break;
-        }
-
-        setStatus(`Synthesizing chunk ${index + 1} of ${totalChunks}…`);
-        let blob;
-        try {
-          blob = await fetchChunkBlob(index, generation);
-        } catch (error) {
-          if (error.name === "AbortError" || !isPlaybackActive(generation)) {
-            break;
-          }
-          throw error;
-        }
-
-        prefetchChunk(index + 1, generation);
-
-        setStatus(`Playing chunk ${index + 1} of ${totalChunks}`);
-        let finished = false;
-        try {
-          finished = await playBlob(blob, index, generation);
-        } catch (error) {
-          if (!isPlaybackActive(generation)) {
-            break;
-          }
-          throw error;
-        }
-
-        if (!isPlaybackActive(generation)) {
-          currentChunk = finished ? index + 1 : index;
-          updateProgress();
-          break;
-        }
-
-        if (!finished) {
-          if (isPaused) {
-            currentChunk = index;
-            updateProgress();
-            break;
-          }
-          throw new Error(`Playback stopped unexpectedly at section ${index + 1}`);
-        }
-
-        currentChunk = index + 1;
-        updateProgress();
-      }
-
-      if (!isPlaybackActive(generation)) {
-        applyStartPosition(currentChunk);
-        setStatus("Stopped");
-        return;
-      }
-
-      if (currentChunk >= totalChunks) {
-        setStatus("Finished");
-        sessionId = null;
-        totalChunks = 0;
-        currentChunk = 0;
-        updateProgress();
-        showEditMode();
-      } else if (isPaused) {
-        setStatus("Paused");
-      }
-    } catch (error) {
-      if (!isPlaybackActive(generation)) {
-        return;
-      }
-      setStatus("Playback failed");
-      fetchWarning.textContent =
-        error.name === "AbortError"
-          ? "Preparing timed out. Try again or restart the server."
-          : error.message;
-      fetchWarning.classList.remove("hidden");
-      showEditMode();
-    } finally {
-      playAllPromise = null;
-      playAllLock = false;
-      stopChunkStatusPoll();
-      if (!isPlaybackActive(generation)) {
-        return;
-      }
-      if (isPaused) {
-        setButtons({ playing: true, paused: true });
-      } else {
-        setButtons({ playing: false, paused: false });
-      }
-      updateChunkPipeline();
+  const worker = runPlaybackLoop(generation, { skipPositionReset }).catch((error) => {
+    if (!isPlaybackActive(generation)) {
+      return;
     }
-  })();
+    setStatus("Playback failed");
+    fetchWarning.textContent =
+      error.name === "AbortError"
+        ? "Preparing timed out. Try again or restart the server."
+        : error.message;
+    fetchWarning.classList.remove("hidden");
+    showReadingMode();
+    updateSidebarIndicators();
+    setButtons({ playing: false, paused: false });
+  });
 
-  await playAllPromise;
+  playAllPromise = worker;
+  try {
+    await worker;
+  } finally {
+    if (playAllPromise !== worker) {
+      return;
+    }
+    playAllPromise = null;
+    playAllLock = false;
+    stopChunkStatusPoll();
+    if (!isPlaybackActive(generation)) {
+      return;
+    }
+    if (isPaused) {
+      setButtons({ playing: true, paused: true });
+    } else {
+      setButtons({ playing: false, paused: false });
+    }
+    updateChunkPipeline();
+  }
+}
+
+async function playAll(options = {}) {
+  return beginPlayback(options);
 }
 
 function pausePlayback() {
@@ -1068,44 +1543,133 @@ function pausePlayback() {
   setButtons({ playing: true, paused: true });
 }
 
-function stopPlayback() {
+async function stopPlayback({ statusMessage = "Stopped", resumeChunk = null } = {}) {
   const activeSessionId = sessionId;
+  const audio = currentAudio;
   playbackGeneration += 1;
-  playAllLock = false;
+  pendingResumeRatio = 0;
   isPaused = false;
   stopChunkStatusPoll();
+  if (cancelActiveBlobPlayback) {
+    cancelActiveBlobPlayback(false);
+    cancelActiveBlobPlayback = null;
+  }
   abortPendingFetches();
-  if (currentAudio) {
-    detachAudio(currentAudio);
-    currentAudio = null;
+  if (audio) {
+    detachAudio(audio);
+    if (currentAudio === audio) {
+      currentAudio = null;
+    }
   }
   prefetchCache.clear();
   cancelServerSession(activeSessionId);
   sessionId = null;
-  if (totalChunks > 0) {
-    applyStartPosition(currentChunk);
+  await waitForActivePlaybackWorker();
+  playAllPromise = null;
+  playAllLock = false;
+  if (resumeChunk !== null) {
+    restoreChunkPosition(resumeChunk, { preserveScroll: readingScrollLocked });
+  } else if (totalChunks > 0) {
+    restoreChunkPosition(currentChunk, { preserveScroll: readingScrollLocked });
   } else {
     updateProgress();
   }
-  setStatus("Stopped");
+  setStatus(statusMessage);
   setButtons({ playing: false, paused: false });
 }
 
-function resetSession() {
-  if (playAllPromise || currentAudio) {
-    stopPlayback();
+async function bindNewSession(startChunk, { checkGeneration = null } = {}) {
+  const text = getReadableText();
+  if (!text) {
+    throw new Error("Add some text first. If URL fetch failed, paste the article text.");
+  }
+
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), 15000);
+
+  const response = await fetch("/api/prepare", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      text,
+      speaker: voiceSelect.value,
+      chunk_chars: 600,
+      steady_reading: steadyReadingToggle.checked,
+    }),
+    signal: controller.signal,
+  }).finally(() => window.clearTimeout(timeoutId));
+
+  if (checkGeneration !== null && !isPlaybackActive(checkGeneration)) {
+    throw new DOMException("Playback stopped", "AbortError");
+  }
+
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data.error || "Could not prepare audio");
+  }
+
+  sessionId = data.session_id;
+  totalChunks = data.chunk_count;
+  chunkStarts = data.chunk_starts || [];
+  prefetchCache.clear();
+  currentChunk = clampChunkIndex(startChunk ?? currentChunk);
+  return data;
+}
+
+async function waitForActivePlaybackWorker() {
+  while (playAllLock && !playAllPromise) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  if (playAllPromise) {
+    await playAllPromise.catch(() => {});
+  }
+}
+
+async function interruptPlaybackForReswitch() {
+  const activeSessionId = sessionId;
+  const audio = currentAudio;
+  playbackGeneration += 1;
+  isPaused = false;
+  stopChunkStatusPoll();
+  if (cancelActiveBlobPlayback) {
+    cancelActiveBlobPlayback(false);
+    cancelActiveBlobPlayback = null;
+  }
+  abortPendingFetches();
+  if (audio) {
+    detachAudio(audio);
+    if (currentAudio === audio) {
+      currentAudio = null;
+    }
+  }
+  prefetchCache.clear();
+  sessionId = null;
+  cancelServerSession(activeSessionId);
+  setButtons({ playing: false, paused: false });
+  await waitForActivePlaybackWorker();
+  playAllPromise = null;
+  playAllLock = false;
+  stopChunkStatusPoll();
+}
+
+async function refreshSessionOnly(generation = playbackGeneration, startChunk = null) {
+  const data = await bindNewSession(startChunk, { checkGeneration: generation });
+  clearAudioCacheStates(currentChunk);
+  return data;
+}
+
+async function resetSession() {
+  if (playbackReswitchActive) {
+    return;
+  }
+  if (playAllPromise || playAllLock || currentAudio) {
+    await stopPlayback();
   }
   sessionId = null;
   totalChunks = 0;
   currentChunk = 0;
-  chunkTexts = [];
-  chunkStarts = [];
-  chunkElements = [];
-  chunkStates = [];
   prefetchCache.clear();
-  if (chunkPipeline) {
-    chunkPipeline.classList.add("hidden");
-  }
+  clearReadingSurface();
   updateProgress();
   updateTextMeta();
   showEditMode();
@@ -1128,8 +1692,15 @@ openBtn.addEventListener("click", () => {
   }
 });
 pasteBtn.addEventListener("click", pasteClipboard);
-editModeBtn.addEventListener("click", () => {
-  stopPlayback();
+editModeBtn.addEventListener("click", async () => {
+  await stopPlayback();
+  sessionId = null;
+  totalChunks = 0;
+  currentChunk = 0;
+  prefetchCache.clear();
+  clearReadingSurface();
+  updateProgress();
+  updateTextMeta();
   showEditMode();
 });
 textInput.addEventListener("input", () => {
@@ -1138,16 +1709,82 @@ textInput.addEventListener("input", () => {
 });
 textInput.addEventListener("click", rememberCursorStart);
 textInput.addEventListener("keyup", rememberCursorStart);
-readingView.addEventListener("click", (event) => {
+readingView.addEventListener("click", async (event) => {
   const chunk = event.target.closest(".chunk");
   if (!chunk) {
     return;
   }
-  jumpToChunk(Number(chunk.dataset.index));
+  await jumpToChunk(Number(chunk.dataset.index));
 });
-voiceSelect.addEventListener("change", resetSession);
-steadyReadingToggle.addEventListener("change", resetSession);
-modelSelect.addEventListener("change", updateModelControls);
+voiceSelect.addEventListener("pointerdown", () => {
+  voiceSelect.dataset.previousVoice = voiceSelect.value;
+});
+
+voiceSelect.addEventListener("change", async () => {
+  const previousVoice = voiceSelect.dataset.previousVoice || voiceSelect.value;
+  if (!hasActiveReadingSession()) {
+    voiceSelect.dataset.previousVoice = voiceSelect.value;
+    return;
+  }
+  try {
+    fetchWarning.classList.add("hidden");
+    await selectCurrentVoice();
+    voiceSelect.dataset.previousVoice = voiceSelect.value;
+  } catch (error) {
+    voiceSelect.value = previousVoice;
+    fetchWarning.textContent = error.message;
+    fetchWarning.classList.remove("hidden");
+    setStatus("Ready");
+  }
+});
+
+steadyReadingToggle.addEventListener("change", async () => {
+  const previousValue = !steadyReadingToggle.checked;
+  if (!hasActiveReadingSession()) {
+    return;
+  }
+  try {
+    fetchWarning.classList.add("hidden");
+    await applySteadyReadingChange();
+  } catch (error) {
+    steadyReadingToggle.checked = previousValue;
+    fetchWarning.textContent = error.message;
+    fetchWarning.classList.remove("hidden");
+    setStatus("Ready");
+  }
+});
+modelSelect.addEventListener("pointerdown", () => {
+  modelSelect.dataset.previousModel = modelSelect.value;
+});
+
+modelSelect.addEventListener("change", async () => {
+  const previousModel = modelSelect.dataset.previousModel || modelSelect.value;
+  const model = selectedModel();
+  updateModelControls();
+
+  if (!model || model.selected) {
+    modelSelect.dataset.previousModel = modelSelect.value;
+    return;
+  }
+
+  if (model.status !== "ready" && model.status !== "partial") {
+    return;
+  }
+
+  try {
+    modelWarning.classList.add("hidden");
+    fetchWarning.classList.add("hidden");
+    await selectCurrentModel();
+    modelSelect.dataset.previousModel = modelSelect.value;
+  } catch (error) {
+    modelSelect.value = previousModel;
+    modelWarning.textContent = error.message;
+    modelWarning.classList.remove("hidden");
+    updateModelControls();
+    setStatus("Ready");
+  }
+});
+
 downloadModelBtn.addEventListener("click", async () => {
   try {
     const model = selectedModel();
@@ -1165,7 +1802,9 @@ downloadModelBtn.addEventListener("click", async () => {
     updateModelControls();
   }
 });
-playBtn.addEventListener("click", playAll);
+playBtn.addEventListener("click", () => {
+  void playAll();
+});
 pauseBtn.addEventListener("click", pausePlayback);
 stopBtn.addEventListener("click", stopPlayback);
 speedSlider.addEventListener("input", updateSpeedLabel);
@@ -1186,6 +1825,7 @@ async function bootstrap() {
   }
 
   await Promise.all([loadVoices(), loadModels(), loadModelStatus()]);
+  updatePlaybackControls();
   updateTextMeta();
   updateSpeedLabel();
   setStatus("Ready");

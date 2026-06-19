@@ -23,17 +23,22 @@ from tts_engine import (
     DEFAULT_REPETITION_PENALTY,
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_P,
-    SPEAKERS,
+    READ_ALOUD_VOICE_TYPES,
     STEADY_READING_INSTRUCT,
+    catalog_entry,
     chunk_offsets,
     download_model,
     get_backend_info,
     list_models,
+    list_voices,
     load_model,
     model_download_status,
+    configure_tts_runtime,
+    resolve_speaker,
     set_current_model,
     synthesize_chunk,
 )
+from build_info import get_build_info
 from url_fetcher import fetch_url
 
 app = Flask(__name__)
@@ -125,6 +130,7 @@ def synthesis_worker() -> None:
                 speaker=job["speaker"],
                 language=job["language"],
                 instruct=job.get("instruct"),
+                model_id=ACTIVE_MODEL_ID,
                 temperature=job.get("temperature", DEFAULT_TEMPERATURE),
                 top_p=job.get("top_p", DEFAULT_TOP_P),
                 repetition_penalty=job.get("repetition_penalty", DEFAULT_REPETITION_PENALTY),
@@ -137,6 +143,7 @@ def synthesis_worker() -> None:
 
 
 def start_synthesis_worker() -> None:
+    configure_tts_runtime()
     thread = threading.Thread(target=synthesis_worker, daemon=True)
     thread.start()
     request_model_reload(DEFAULT_MODEL, blocking=True)
@@ -217,7 +224,7 @@ def wav_bytes(audio: np.ndarray, sample_rate: int) -> bytes:
 
 @app.get("/")
 def index():
-    return render_template("index.html")
+    return render_template("index.html", build=get_build_info())
 
 
 @app.get("/api/status")
@@ -225,6 +232,7 @@ def status():
     payload = get_backend_info(ACTIVE_MODEL_ID)
     payload["ready"] = MODEL_READY.is_set() and not MODEL_LOADING.is_set()
     payload["loading"] = MODEL_LOADING.is_set()
+    payload["build"] = get_build_info()
     return jsonify(payload)
 
 
@@ -244,12 +252,10 @@ def api_select_model():
     if status != "ready":
         return jsonify({"error": "Download this model before selecting it."}), 400
 
-    from tts_engine import MODEL_CATALOG
-
-    catalog = next((item for item in MODEL_CATALOG if item["id"] == model_id), None)
-    if catalog and catalog.get("voice_type") != "custom":
+    catalog = catalog_entry(model_id)
+    if catalog and catalog.get("voice_type") not in READ_ALOUD_VOICE_TYPES:
         return jsonify(
-            {"error": "This model type is not supported for read-aloud yet. Choose a CustomVoice MLX model."}
+            {"error": "This model type is not supported for read-aloud yet. Choose a preset-voice MLX model."}
         ), 400
 
     try:
@@ -283,16 +289,7 @@ def api_download_model():
 
 @app.get("/api/voices")
 def voices():
-    payload = []
-    for key, name in SPEAKERS.items():
-        payload.append(
-            {
-                "id": key,
-                "label": f"{name} ({key})",
-                "default": key == "ryan",
-            }
-        )
-    return jsonify({"voices": payload})
+    return jsonify({"voices": list_voices(ACTIVE_MODEL_ID)})
 
 
 @app.post("/api/fetch")
@@ -318,12 +315,14 @@ def api_prepare():
     if not text:
         return jsonify({"error": "Text is required"}), 400
 
-    speaker_key = (payload.get("speaker") or "ryan").lower().replace("-", "_")
-    speaker = SPEAKERS.get(speaker_key, payload.get("speaker") or "Ryan")
+    model_info = catalog_entry(ACTIVE_MODEL_ID) or {}
+    speaker = resolve_speaker(payload.get("speaker"), ACTIVE_MODEL_ID)
     chunk_chars = int(payload.get("chunk_chars") or 600)
     steady_reading = payload.get("steady_reading", True)
     if isinstance(steady_reading, str):
         steady_reading = steady_reading.lower() not in {"0", "false", "no", "off"}
+    if not model_info.get("supports_steady_reading"):
+        steady_reading = False
     instruct = STEADY_READING_INSTRUCT if steady_reading else None
     chunks = chunk_text(text, chunk_chars)
     starts = chunk_offsets(chunks, text)
