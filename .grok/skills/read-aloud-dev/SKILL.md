@@ -7,7 +7,7 @@ description: >
 
 # Read Aloud development
 
-1. Read `AGENTS.md` and `DEVELOPMENT.md`.
+1. Read `AGENTS.md`, `DESIGN.md`, and `DEVELOPMENT.md`.
 2. Run: `source venv/bin/activate && python read_aloud_server.py --no-browser`
 3. MLX synthesis only on `synthesis_worker` — queue via `SYNTH_QUEUE`.
 4. Do not commit `venv/` or model weights (HF cache is under `~/.cache/huggingface`).

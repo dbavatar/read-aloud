@@ -33,4 +33,4 @@ Default model: `mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit`.
 
 - Python 3.12 venv at `venv/`
 - Do not commit venvs or generated audio
-- See `DEVELOPMENT.md` for APIs and follow-ups
+- See `DEVELOPMENT.md` for APIs and `DESIGN.md` for decisions, constraints, and beta history

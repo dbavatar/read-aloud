@@ -4,6 +4,8 @@
 
 Local read-aloud for long text (URL fetch + paste) with MLX Qwen3 CustomVoice on Apple Silicon.
 
+**Design context:** see [DESIGN.md](DESIGN.md) for architecture decisions, threading rules, playback model, and bugs fixed during beta.
+
 ## Layout
 
 | File | Role |

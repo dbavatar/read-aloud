@@ -46,8 +46,9 @@ python read_aloud.py --text "Hello world" --speaker ryan
 
 ## Development
 
-- `AGENTS.md` — agent/Grok project context
-- `DEVELOPMENT.md` — architecture and APIs
+- `AGENTS.md` — agent/Grok project rules (auto-loaded)
+- `DESIGN.md` — architecture decisions and compacted beta history
+- `DEVELOPMENT.md` — file map and APIs
 - `.grok/skills/read-aloud-dev/` — Grok skill for this repo
 
 ## License
