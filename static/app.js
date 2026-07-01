@@ -32,6 +32,7 @@ let sessionId = null;
 let totalChunks = 0;
 let currentChunk = 0;
 let currentAudio = null;
+let activeBlobTiming = null;
 let isPaused = false;
 let playbackGeneration = 0;
 let playAllPromise = null;
@@ -51,6 +52,10 @@ let cancelActiveBlobPlayback = null;
 let blobDurationCache = new WeakMap();
 let startOffset = 0;
 let lastScrollAt = 0;
+const SPEED_STORAGE_KEY = "readAloud.playbackSpeed";
+const MIN_PLAYBACK_SPEED = 0.5;
+const MAX_PLAYBACK_SPEED = 4;
+let preferredPlaybackSpeed = 2;
 let pendingReswitchChunk = null;
 let pendingResumeRatio = 0;
 let readingScrollLocked = false;
@@ -231,6 +236,54 @@ function escapeHtml(value) {
     .replaceAll(">", "&gt;");
 }
 
+function prepareText(value) {
+  let text = String(value ?? "").replace(/\r\n?/g, "\n");
+  text = text.replace(/```[\s\S]*?```/g, " ");
+  text = text.replace(/`([^`]+)`/g, "$1");
+  text = text.replace(/\[([^\]]+)\]\([^)]+\)/g, "$1");
+  text = text.replace(/[*_#>]+/g, " ");
+  text = text.replace(/[^\S\n]+/g, " ");
+  text = text.replace(/\n{3,}/g, "\n\n");
+  return text.trim();
+}
+
+function getPlaybackStartOffset() {
+  const raw = textInput.value;
+  const selection = textInput.selectionStart ?? 0;
+  const preparedBefore = prepareText(raw.slice(0, selection));
+  const preparedFull = prepareText(raw);
+  return Math.min(preparedBefore.length, preparedFull.length);
+}
+
+function getOffsetForChunkIndex(chunkIndex, ratio = 0) {
+  if (!chunkStarts.length || !chunkTexts.length) {
+    return 0;
+  }
+  const index = clampChunkIndex(chunkIndex);
+  const start = chunkStarts[index] ?? 0;
+  const body = chunkTexts[index] || "";
+  const clampedRatio = Math.max(0, Math.min(1, ratio));
+  return start + Math.floor(body.length * clampedRatio);
+}
+
+function resolvePrepareStartOffset({ hadReadingView = false, startChunk = null } = {}) {
+  if (!hadReadingView || !chunkTexts.length) {
+    return getPlaybackStartOffset();
+  }
+  const index = startChunk ?? currentChunk;
+  return getOffsetForChunkIndex(index, getChunkReadRatio(index));
+}
+
+function buildPreparePayload({ startOffset = null } = {}) {
+  return {
+    text: getReadableText(),
+    speaker: voiceSelect.value,
+    chunk_chars: 600,
+    steady_reading: steadyReadingToggle.checked,
+    start_offset: startOffset ?? getPlaybackStartOffset(),
+  };
+}
+
 function setStatus(message) {
   playbackStatus.textContent = message;
 }
@@ -276,10 +329,7 @@ async function cancelServerSession(activeSessionId) {
 }
 
 function getCursorOffsetInTrimmedText() {
-  const raw = textInput.value;
-  const leading = raw.length - raw.trimStart().length;
-  const trimmedLength = raw.trim().length;
-  return Math.max(0, Math.min(trimmedLength, textInput.selectionStart - leading));
+  return getPlaybackStartOffset();
 }
 
 function findChunkIndexForOffset(offset) {
@@ -468,14 +518,78 @@ async function jumpToChunk(index) {
   setStatus(`Start set at section ${index + 1} of ${totalChunks}. Press Play to continue.`);
 }
 
+function clampPlaybackSpeed(speed) {
+  const value = Number(speed);
+  if (!Number.isFinite(value)) {
+    return preferredPlaybackSpeed;
+  }
+  return Math.min(MAX_PLAYBACK_SPEED, Math.max(MIN_PLAYBACK_SPEED, value));
+}
+
 function playbackSpeed() {
-  return Number(speedSlider.value);
+  return preferredPlaybackSpeed;
+}
+
+function loadStoredPlaybackSpeed() {
+  const stored = Number(localStorage.getItem(SPEED_STORAGE_KEY));
+  if (Number.isFinite(stored)) {
+    return clampPlaybackSpeed(stored);
+  }
+  return clampPlaybackSpeed(speedSlider.value);
+}
+
+function persistPlaybackSpeed(speed) {
+  localStorage.setItem(SPEED_STORAGE_KEY, String(speed));
+}
+
+function setPlaybackSpeed(speed) {
+  preferredPlaybackSpeed = clampPlaybackSpeed(speed);
+  speedSlider.value = String(preferredPlaybackSpeed);
+  persistPlaybackSpeed(preferredPlaybackSpeed);
+  reflectSpeedUi();
+  applySpeedToCurrentAudio();
+}
+
+function reflectSpeedUi() {
+  speedSlider.value = String(preferredPlaybackSpeed);
+  speedValue.textContent = `${preferredPlaybackSpeed.toFixed(1)}x`;
+}
+
+function applySpeedToCurrentAudio() {
+  if (!currentAudio) {
+    return;
+  }
+  enforceAudioSpeed(currentAudio, { force: true });
+  if (activeBlobTiming?.audio === currentAudio) {
+    activeBlobTiming.scheduleEndWatchdog();
+  }
+}
+
+function enforceAudioSpeed(audio, { force = false, afterSeek = false } = {}) {
+  if (!audio) {
+    return;
+  }
+  const speed = playbackSpeed();
+  if (force || audio.defaultPlaybackRate !== speed) {
+    audio.defaultPlaybackRate = speed;
+  }
+  if (force || audio.playbackRate !== speed) {
+    audio.playbackRate = speed;
+  }
+  if (afterSeek) {
+    window.requestAnimationFrame(() => {
+      if (audio.defaultPlaybackRate !== speed) {
+        audio.defaultPlaybackRate = speed;
+      }
+      if (audio.playbackRate !== speed) {
+        audio.playbackRate = speed;
+      }
+    });
+  }
 }
 
 function applyAudioSpeed(audio) {
-  const speed = playbackSpeed();
-  audio.defaultPlaybackRate = speed;
-  audio.playbackRate = speed;
+  enforceAudioSpeed(audio, { force: true });
 }
 
 async function getBlobDuration(blob) {
@@ -493,12 +607,11 @@ async function getBlobDuration(blob) {
   }
 }
 
-function updateSpeedLabel() {
-  const speed = playbackSpeed().toFixed(1);
-  speedValue.textContent = `${speed}x`;
-  if (currentAudio) {
-    applyAudioSpeed(currentAudio);
-  }
+function onSpeedControlInput() {
+  preferredPlaybackSpeed = clampPlaybackSpeed(speedSlider.value);
+  persistPlaybackSpeed(preferredPlaybackSpeed);
+  reflectSpeedUi();
+  applySpeedToCurrentAudio();
 }
 
 function updateChunkPipeline() {
@@ -634,7 +747,7 @@ function updateProgress() {
 }
 
 function getReadableText() {
-  return textInput.value.trim();
+  return prepareText(textInput.value);
 }
 
 function showReadingMode() {
@@ -1081,12 +1194,8 @@ async function prepareSession(
     throw new Error("Add some text first. If URL fetch failed, paste the article text.");
   }
 
-  const resumeAt =
-    startChunk ??
-    (totalChunks > 0 || chunkTexts.length > 0
-      ? currentChunk
-      : findChunkIndexForOffset(startOffset));
   const hadReadingView = chunkTexts.length > 0;
+  const resumeAt = startChunk ?? (hadReadingView ? currentChunk : null);
   const scrollTop = preserveScroll || hadReadingView ? captureReadingScroll() : null;
 
   const controller = new AbortController();
@@ -1095,12 +1204,11 @@ async function prepareSession(
   const response = await fetch("/api/prepare", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      text,
-      speaker: voiceSelect.value,
-      chunk_chars: 600,
-      steady_reading: steadyReadingToggle.checked,
-    }),
+    body: JSON.stringify(
+      buildPreparePayload({
+        startOffset: resolvePrepareStartOffset({ hadReadingView, startChunk: resumeAt }),
+      }),
+    ),
     signal: controller.signal,
   }).finally(() => window.clearTimeout(timeoutId));
 
@@ -1125,8 +1233,13 @@ async function prepareSession(
     buildReadingView(chunks);
   }
 
-  const startIndex = clampChunkIndex(resumeAt);
+  const startIndex = clampChunkIndex(resumeAt ?? data.start_chunk ?? 0);
+  const startRatio = resumeAt === null ? Number(data.start_ratio) || 0 : 0;
+  pendingResumeRatio = startRatio;
   restoreChunkPosition(startIndex, { preserveScroll: preserveScroll || reuseView });
+  if (startRatio > 0) {
+    setChunkProgress(startIndex, startRatio);
+  }
 
   if (scrollTop !== null) {
     restoreReadingScroll(scrollTop);
@@ -1199,14 +1312,14 @@ async function playBlob(blob, chunkIndex, generation) {
     return false;
   }
 
-  let mediaDuration = 0;
+  let decodedDuration = 0;
   try {
-    mediaDuration = await getBlobDuration(blob);
+    decodedDuration = await getBlobDuration(blob);
   } catch (_error) {
     throw new Error("Could not decode audio for playback");
   }
 
-  if (!isPlaybackActive(generation) || mediaDuration <= 0) {
+  if (!isPlaybackActive(generation) || decodedDuration <= 0) {
     return false;
   }
 
@@ -1217,53 +1330,102 @@ async function playBlob(blob, chunkIndex, generation) {
     const audio = new Audio();
     currentAudio = audio;
     let rafId = 0;
-    let playStartedAt = 0;
     let completed = false;
     let endTimer = 0;
     const clampedStart = Math.max(0, Math.min(1, startRatio));
 
+    const effectiveDuration = () => {
+      if (Number.isFinite(audio.duration) && audio.duration > 0) {
+        return audio.duration;
+      }
+      return decodedDuration;
+    };
+
+    const getRatio = () => {
+      const duration = effectiveDuration();
+      if (duration <= 0) {
+        return clampedStart;
+      }
+      if (audio.currentTime > 0) {
+        return Math.min(1, Math.max(clampedStart, audio.currentTime / duration));
+      }
+      return clampedStart;
+    };
+
+    const isNearEnd = () => {
+      const duration = effectiveDuration();
+      return duration > 0 && (audio.ended || audio.currentTime >= duration - 0.08);
+    };
+
+    const seekToStart = () => {
+      if (clampedStart <= 0) {
+        return;
+      }
+      const duration = effectiveDuration();
+      if (duration > 0) {
+        audio.currentTime = clampedStart * duration;
+        enforceAudioSpeed(audio, { force: true, afterSeek: true });
+        setChunkProgress(chunkIndex, clampedStart);
+      }
+    };
+
+    const scheduleEndWatchdog = () => {
+      window.clearTimeout(endTimer);
+      if (completed) {
+        return;
+      }
+      const duration = effectiveDuration();
+      const speed = Math.max(0.25, playbackSpeed());
+      const remainingMedia = Math.max(0, duration - audio.currentTime);
+      const wallMs = (remainingMedia / speed) * 1000;
+      const ms = Math.max(1500, wallMs + 2500);
+      endTimer = window.setTimeout(() => {
+        if (completed) {
+          return;
+        }
+        if (isNearEnd()) {
+          finishChunk(isPlaybackActive(generation));
+          return;
+        }
+        scheduleEndWatchdog();
+      }, ms);
+    };
+
+    const onPlaying = () => {
+      enforceAudioSpeed(audio, { force: true });
+    };
+
     const cleanup = () => {
       window.clearTimeout(endTimer);
       cancelAnimationFrame(rafId);
+      audio.removeEventListener("playing", onPlaying);
       audio.onended = null;
       audio.ontimeupdate = null;
       audio.onerror = null;
       audio.pause();
       URL.revokeObjectURL(url);
-    };
-
-    const scheduleEndWatchdog = () => {
-      window.clearTimeout(endTimer);
-      const speed = playbackSpeed();
-      const remaining = (mediaDuration * (1 - clampedStart)) / speed;
-      const ms = Math.max(750, remaining * 1000 + 1000);
-      endTimer = window.setTimeout(() => {
-        if (!completed) {
-          finishChunk(isPlaybackActive(generation));
-        }
-      }, ms);
-    };
-
-    const getRatio = () => {
-      const speed = playbackSpeed();
-      const audioRatio =
-        audio.currentTime > 0 ? audio.currentTime / mediaDuration : 0;
-      const wallRatio =
-        playStartedAt > 0
-          ? (performance.now() - playStartedAt) / 1000 / (mediaDuration / speed)
-          : 0;
-      return Math.min(1, Math.max(audioRatio, wallRatio));
+      if (activeBlobTiming?.audio === audio) {
+        activeBlobTiming = null;
+      }
     };
 
     const updateHighlight = () => {
       if (!isPlaybackActive(generation) || currentAudio !== audio) {
         return;
       }
+      enforceAudioSpeed(audio);
       setChunkProgress(chunkIndex, getRatio());
     };
 
     const tick = () => {
+      enforceAudioSpeed(audio, { force: true });
       updateHighlight();
+      if (isNearEnd()) {
+        if (audio.ended) {
+          finishChunk(isPlaybackActive(generation));
+          return;
+        }
+      }
       if (!audio.paused && !audio.ended) {
         rafId = requestAnimationFrame(tick);
       }
@@ -1289,6 +1451,7 @@ async function playBlob(blob, chunkIndex, generation) {
     };
 
     cancelActiveBlobPlayback = finishChunk;
+    activeBlobTiming = { audio, scheduleEndWatchdog };
 
     audio.onended = () => {
       finishChunk(isPlaybackActive(generation));
@@ -1305,7 +1468,15 @@ async function playBlob(blob, chunkIndex, generation) {
       reject(new Error("Audio playback failed"));
     };
 
-    audio.ontimeupdate = () => updateHighlight();
+    audio.ontimeupdate = () => {
+      enforceAudioSpeed(audio, { force: true });
+      updateHighlight();
+      if (isNearEnd() && !completed) {
+        scheduleEndWatchdog();
+      }
+    };
+
+    audio.addEventListener("playing", onPlaying);
 
     const beginPlay = () => {
       if (!isPlaybackActive(generation)) {
@@ -1318,7 +1489,6 @@ async function playBlob(blob, chunkIndex, generation) {
       } else if (!readingScrollLocked) {
         setChunkProgress(chunkIndex, 0);
       }
-      playStartedAt = performance.now();
       audio
         .play()
         .then(() => {
@@ -1327,12 +1497,7 @@ async function playBlob(blob, chunkIndex, generation) {
             finishChunk(false);
             return;
           }
-          applyAudioSpeed(audio);
-          if (clampedStart > 0) {
-            audio.currentTime = clampedStart * mediaDuration;
-            setChunkProgress(chunkIndex, clampedStart);
-          }
-          playStartedAt = performance.now();
+          enforceAudioSpeed(audio, { force: true });
           scheduleEndWatchdog();
           rafId = requestAnimationFrame(tick);
         })
@@ -1345,12 +1510,39 @@ async function playBlob(blob, chunkIndex, generation) {
         });
     };
 
-    audio.addEventListener("loadedmetadata", () => applyAudioSpeed(audio), { once: true });
-    audio.src = url;
-    if (audio.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) {
+    let playbackPrepared = false;
+    const prepareAndPlay = () => {
+      if (playbackPrepared || completed) {
+        return;
+      }
+      const duration = effectiveDuration();
+      if (duration <= 0) {
+        return;
+      }
+      playbackPrepared = true;
+      enforceAudioSpeed(audio, { force: true });
+      seekToStart();
       beginPlay();
-    } else {
-      audio.addEventListener("canplay", beginPlay, { once: true });
+    };
+
+    audio.addEventListener("loadedmetadata", prepareAndPlay, { once: true });
+    audio.addEventListener(
+      "durationchange",
+      () => {
+        if (!playbackPrepared) {
+          prepareAndPlay();
+        }
+      },
+      { once: true },
+    );
+
+    const initialSpeed = playbackSpeed();
+    audio.defaultPlaybackRate = initialSpeed;
+    audio.playbackRate = initialSpeed;
+    audio.preservesPitch = true;
+    audio.src = url;
+    if (audio.readyState >= HTMLMediaElement.HAVE_METADATA) {
+      prepareAndPlay();
     }
   });
 }
@@ -1361,7 +1553,7 @@ async function runPlaybackLoop(generation, { skipPositionReset = false } = {}) {
     if (chunkTexts.length > 0) {
       await refreshSessionOnly(generation, currentChunk);
     } else {
-      await prepareSession(generation, currentChunk, { preserveScroll: readingScrollLocked });
+      await prepareSession(generation, null, { preserveScroll: readingScrollLocked });
     }
     if (!isPlaybackActive(generation)) {
       return;
@@ -1425,6 +1617,10 @@ async function runPlaybackLoop(generation, { skipPositionReset = false } = {}) {
       throw new Error(`Playback stopped unexpectedly at section ${index + 1}`);
     }
 
+    if (index + 1 < totalChunks && isPlaybackActive(generation)) {
+      await new Promise((resolve) => window.setTimeout(resolve, 40));
+    }
+
     currentChunk = index + 1;
     updateProgress();
   }
@@ -1451,6 +1647,11 @@ async function beginPlayback({ force = false, skipPositionReset = false } = {}) 
     fetchWarning.classList.remove("hidden");
     setStatus("Ready");
     return;
+  }
+
+  if (!isReadingMode || chunkTexts.length === 0) {
+    startOffset = getPlaybackStartOffset();
+    updateTextMeta();
   }
 
   if (!force && (playAllPromise || playAllLock)) {
@@ -1590,12 +1791,14 @@ async function bindNewSession(startChunk, { checkGeneration = null } = {}) {
   const response = await fetch("/api/prepare", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      text,
-      speaker: voiceSelect.value,
-      chunk_chars: 600,
-      steady_reading: steadyReadingToggle.checked,
-    }),
+    body: JSON.stringify(
+      buildPreparePayload({
+        startOffset:
+          startChunk != null
+            ? getOffsetForChunkIndex(startChunk, getChunkReadRatio(startChunk))
+            : getPlaybackStartOffset(),
+      }),
+    ),
     signal: controller.signal,
   }).finally(() => window.clearTimeout(timeoutId));
 
@@ -1708,7 +1911,14 @@ textInput.addEventListener("input", () => {
   updateTextMeta();
 });
 textInput.addEventListener("click", rememberCursorStart);
+textInput.addEventListener("mouseup", rememberCursorStart);
 textInput.addEventListener("keyup", rememberCursorStart);
+textInput.addEventListener("select", rememberCursorStart);
+document.addEventListener("selectionchange", () => {
+  if (document.activeElement === textInput) {
+    rememberCursorStart();
+  }
+});
 readingView.addEventListener("click", async (event) => {
   const chunk = event.target.closest(".chunk");
   if (!chunk) {
@@ -1807,12 +2017,12 @@ playBtn.addEventListener("click", () => {
 });
 pauseBtn.addEventListener("click", pausePlayback);
 stopBtn.addEventListener("click", stopPlayback);
-speedSlider.addEventListener("input", updateSpeedLabel);
+speedSlider.addEventListener("input", onSpeedControlInput);
+speedSlider.addEventListener("change", onSpeedControlInput);
 
 document.querySelectorAll("[data-speed]").forEach((button) => {
   button.addEventListener("click", () => {
-    speedSlider.value = button.dataset.speed;
-    updateSpeedLabel();
+    setPlaybackSpeed(button.dataset.speed);
   });
 });
 
@@ -1824,10 +2034,12 @@ async function bootstrap() {
     await fetchUrl();
   }
 
+  preferredPlaybackSpeed = loadStoredPlaybackSpeed();
+  reflectSpeedUi();
+
   await Promise.all([loadVoices(), loadModels(), loadModelStatus()]);
   updatePlaybackControls();
   updateTextMeta();
-  updateSpeedLabel();
   setStatus("Ready");
   const model = selectedModel();
   if (model && model.status === "downloading") {

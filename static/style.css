@@ -189,10 +189,12 @@ button.small {
 }
 
 .reading-view .chunk {
+  display: block;
   border-radius: 6px;
   padding: 1px 0;
   transition: background 0.15s ease;
   cursor: pointer;
+  white-space: pre-wrap;
 }
 
 .reading-view .chunk:hover {

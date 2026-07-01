@@ -37,21 +37,25 @@ def load_text(args: argparse.Namespace) -> str:
     return input("Enter text to read aloud: ").strip()
 
 
-def clean_text(text: str) -> str:
+def clean_text(text: str, *, preserve_paragraphs: bool = False) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
     text = re.sub(r"`([^`]+)`", r"\1", text)
     text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
     text = re.sub(r"[*_#>]+", " ", text)
-    text = re.sub(r"\s+", " ", text)
+    if preserve_paragraphs:
+        text = re.sub(r"[^\S\n]+", " ", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+    else:
+        text = re.sub(r"\s+", " ", text)
     return text.strip()
 
 
-def chunk_text(text: str, max_chars: int) -> list[str]:
+def _chunk_segment(text: str, max_chars: int) -> list[str]:
     if len(text) <= max_chars:
         return [text]
 
-    sentences = re.split(r"(?<=[.!?])\s+", text)
+    sentences = re.split(r"(?<=[.!?])(?:\s+|\n+)", text)
     chunks: list[str] = []
     current = ""
 
@@ -90,6 +94,65 @@ def chunk_text(text: str, max_chars: int) -> list[str]:
         chunks.append(current)
 
     return chunks
+
+
+def chunk_text(text: str, max_chars: int) -> list[str]:
+    if len(text) <= max_chars:
+        return [text]
+
+    paragraphs = re.split(r"\n{2,}", text)
+    chunks: list[str] = []
+    current = ""
+
+    for paragraph in paragraphs:
+        paragraph = paragraph.strip()
+        if not paragraph:
+            continue
+
+        first_segment = True
+        for segment in _chunk_segment(paragraph, max_chars):
+            if first_segment and current:
+                chunks.append(current)
+                current = f"\n\n{segment}"
+                first_segment = False
+                continue
+
+            first_segment = False
+            if not current:
+                current = segment
+                continue
+            if len(current) + 2 + len(segment) <= max_chars:
+                current = f"{current}\n\n{segment}"
+            else:
+                chunks.append(current)
+                current = segment
+
+    if current:
+        chunks.append(current)
+
+    return chunks if chunks else [text]
+
+
+def playback_position_from_offset(
+    offset: int, chunk_starts: list[int], chunks: list[str]
+) -> tuple[int, float]:
+    if not chunks:
+        return 0, 0.0
+
+    offset = max(0, offset)
+    index = 0
+    for i in range(len(chunk_starts) - 1, -1, -1):
+        if offset >= chunk_starts[i]:
+            index = i
+            break
+
+    chunk_start = chunk_starts[index]
+    chunk_body = chunks[index]
+    if not chunk_body:
+        return index, 0.0
+
+    ratio = (offset - chunk_start) / len(chunk_body)
+    return index, max(0.0, min(1.0, ratio))
 
 
 def adjust_speed(audio: np.ndarray, speed: float) -> np.ndarray:

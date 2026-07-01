@@ -17,7 +17,7 @@ import numpy as np
 import soundfile as sf
 from flask import Flask, jsonify, render_template, request, send_file
 
-from read_aloud import chunk_text, clean_text
+from read_aloud import chunk_text, clean_text, playback_position_from_offset
 from tts_engine import (
     DEFAULT_MODEL,
     DEFAULT_REPETITION_PENALTY,
@@ -311,13 +311,15 @@ def api_fetch():
 @app.post("/api/prepare")
 def api_prepare():
     payload = request.get_json(silent=True) or {}
-    text = clean_text(payload.get("text") or "")
+    text = clean_text(payload.get("text") or "", preserve_paragraphs=True)
     if not text:
         return jsonify({"error": "Text is required"}), 400
 
     model_info = catalog_entry(ACTIVE_MODEL_ID) or {}
     speaker = resolve_speaker(payload.get("speaker"), ACTIVE_MODEL_ID)
     chunk_chars = int(payload.get("chunk_chars") or 600)
+    start_offset = max(0, int(payload.get("start_offset") or 0))
+    start_offset = min(start_offset, len(text))
     steady_reading = payload.get("steady_reading", True)
     if isinstance(steady_reading, str):
         steady_reading = steady_reading.lower() not in {"0", "false", "no", "off"}
@@ -326,6 +328,7 @@ def api_prepare():
     instruct = STEADY_READING_INSTRUCT if steady_reading else None
     chunks = chunk_text(text, chunk_chars)
     starts = chunk_offsets(chunks, text)
+    start_chunk, start_ratio = playback_position_from_offset(start_offset, starts, chunks)
 
     session_id = str(uuid.uuid4())
     session = ReadSession(
@@ -347,6 +350,8 @@ def api_prepare():
             "chunks": chunks,
             "chunk_starts": starts,
             "full_text": text,
+            "start_chunk": start_chunk,
+            "start_ratio": start_ratio,
         }
     )
 
