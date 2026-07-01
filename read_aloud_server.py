@@ -25,6 +25,8 @@ from tts_engine import (
     DEFAULT_TOP_P,
     READ_ALOUD_VOICE_TYPES,
     STEADY_READING_INSTRUCT,
+    STEADY_READING_TEMPERATURE,
+    STEADY_READING_TOP_P,
     catalog_entry,
     chunk_offsets,
     download_model,
@@ -36,6 +38,7 @@ from tts_engine import (
     configure_tts_runtime,
     resolve_speaker,
     set_current_model,
+    steady_chunk_instruct,
     synthesize_chunk,
 )
 from build_info import get_build_info
@@ -326,6 +329,8 @@ def api_prepare():
     if not model_info.get("supports_steady_reading"):
         steady_reading = False
     instruct = STEADY_READING_INSTRUCT if steady_reading else None
+    temperature = STEADY_READING_TEMPERATURE if steady_reading else DEFAULT_TEMPERATURE
+    top_p = STEADY_READING_TOP_P if steady_reading else DEFAULT_TOP_P
     chunks = chunk_text(text, chunk_chars)
     starts = chunk_offsets(chunks, text)
     start_chunk, start_ratio = playback_position_from_offset(start_offset, starts, chunks)
@@ -337,6 +342,8 @@ def api_prepare():
         full_text=text,
         speaker=speaker,
         instruct=instruct,
+        temperature=temperature,
+        top_p=top_p,
     )
 
     with SESSION_LOCK:
@@ -408,7 +415,11 @@ def api_chunk(session_id: str, chunk_index: int):
             text=session.chunks[chunk_index],
             speaker=session.speaker,
             language=session.language,
-            instruct=session.instruct,
+            instruct=steady_chunk_instruct(
+                session.instruct,
+                chunk_index,
+                len(session.chunks),
+            ),
             session_id=session_id,
             temperature=session.temperature,
             top_p=session.top_p,

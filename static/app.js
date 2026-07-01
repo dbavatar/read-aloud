@@ -49,7 +49,7 @@ let statusPollTimer = null;
 let chunkStatusPollTimer = null;
 let playAllLock = false;
 let cancelActiveBlobPlayback = null;
-let blobDurationCache = new WeakMap();
+let blobAudioBufferCache = new WeakMap();
 let startOffset = 0;
 let lastScrollAt = 0;
 const SPEED_STORAGE_KEY = "readAloud.playbackSpeed";
@@ -412,13 +412,18 @@ function getChunkReadRatio(index) {
     return 0;
   }
 
-  if (
-    currentAudio &&
-    chunkStates[index] === "playing" &&
-    Number.isFinite(currentAudio.duration) &&
-    currentAudio.duration > 0
-  ) {
-    return Math.max(0, Math.min(1, currentAudio.currentTime / currentAudio.duration));
+  if (currentAudio && chunkStates[index] === "playing") {
+    const duration = currentAudio._mediaDuration || currentAudio.duration;
+    if (Number.isFinite(duration) && duration > 0) {
+      const start = currentAudio._mediaStart || 0;
+      const playable = Math.max(0, duration - start);
+      if (playable <= 0) {
+        return 1;
+      }
+      const progress = Math.max(0, Math.min(1, (currentAudio.currentTime - start) / playable));
+      const base = currentAudio._startRatio || 0;
+      return Math.min(1, base + (1 - base) * progress);
+    }
   }
 
   const readLen = chunkElements[index]?.querySelector(".read-part")?.textContent?.length ?? 0;
@@ -560,8 +565,18 @@ function applySpeedToCurrentAudio() {
     return;
   }
   enforceAudioSpeed(currentAudio, { force: true });
-  if (activeBlobTiming?.audio === currentAudio) {
-    activeBlobTiming.scheduleEndWatchdog();
+}
+
+function applyPreservesPitch(audio) {
+  if (!audio) {
+    return;
+  }
+  audio.preservesPitch = true;
+  if ("webkitPreservesPitch" in audio) {
+    audio.webkitPreservesPitch = true;
+  }
+  if ("mozPreservesPitch" in audio) {
+    audio.mozPreservesPitch = true;
   }
 }
 
@@ -570,6 +585,7 @@ function enforceAudioSpeed(audio, { force = false, afterSeek = false } = {}) {
     return;
   }
   const speed = playbackSpeed();
+  applyPreservesPitch(audio);
   if (force || audio.defaultPlaybackRate !== speed) {
     audio.defaultPlaybackRate = speed;
   }
@@ -578,6 +594,7 @@ function enforceAudioSpeed(audio, { force = false, afterSeek = false } = {}) {
   }
   if (afterSeek) {
     window.requestAnimationFrame(() => {
+      applyPreservesPitch(audio);
       if (audio.defaultPlaybackRate !== speed) {
         audio.defaultPlaybackRate = speed;
       }
@@ -592,19 +609,24 @@ function applyAudioSpeed(audio) {
   enforceAudioSpeed(audio, { force: true });
 }
 
-async function getBlobDuration(blob) {
-  if (blobDurationCache.has(blob)) {
-    return blobDurationCache.get(blob);
+async function getBlobAudioBuffer(blob) {
+  if (blobAudioBufferCache.has(blob)) {
+    return blobAudioBufferCache.get(blob);
   }
-  const buffer = await blob.slice(0).arrayBuffer();
+  const arrayBuffer = await blob.slice(0).arrayBuffer();
   const ctx = new AudioContext();
   try {
-    const audioBuffer = await ctx.decodeAudioData(buffer);
-    blobDurationCache.set(blob, audioBuffer.duration);
-    return audioBuffer.duration;
+    const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
+    blobAudioBufferCache.set(blob, audioBuffer);
+    return audioBuffer;
   } finally {
     await ctx.close();
   }
+}
+
+async function getBlobDuration(blob) {
+  const audioBuffer = await getBlobAudioBuffer(blob);
+  return audioBuffer.duration;
 }
 
 function onSpeedControlInput() {
@@ -816,7 +838,7 @@ function setChunkProgress(index, ratio) {
 
   const readChars = Math.max(
     0,
-    Math.min(text.length, Math.ceil(text.length * clampedRatio)),
+    Math.min(text.length, Math.floor(text.length * clampedRatio)),
   );
   const readPart = escapeHtml(text.slice(0, readChars));
   const unreadPart = escapeHtml(text.slice(readChars));
@@ -1312,14 +1334,14 @@ async function playBlob(blob, chunkIndex, generation) {
     return false;
   }
 
-  let decodedDuration = 0;
+  let mediaDuration = 0;
   try {
-    decodedDuration = await getBlobDuration(blob);
+    mediaDuration = await getBlobDuration(blob);
   } catch (_error) {
     throw new Error("Could not decode audio for playback");
   }
 
-  if (!isPlaybackActive(generation) || decodedDuration <= 0) {
+  if (!isPlaybackActive(generation) || mediaDuration <= 0) {
     return false;
   }
 
@@ -1331,74 +1353,37 @@ async function playBlob(blob, chunkIndex, generation) {
     currentAudio = audio;
     let rafId = 0;
     let completed = false;
-    let endTimer = 0;
+    let earlyEndRetries = 0;
     const clampedStart = Math.max(0, Math.min(1, startRatio));
+    const mediaStart = clampedStart * mediaDuration;
+    const playableMedia = Math.max(0, mediaDuration - mediaStart);
 
-    const effectiveDuration = () => {
-      if (Number.isFinite(audio.duration) && audio.duration > 0) {
-        return audio.duration;
-      }
-      return decodedDuration;
-    };
+    audio._mediaDuration = mediaDuration;
+    audio._mediaStart = mediaStart;
+    audio._startRatio = clampedStart;
 
     const getRatio = () => {
-      const duration = effectiveDuration();
-      if (duration <= 0) {
-        return clampedStart;
+      if (playableMedia <= 0) {
+        return 1;
       }
-      if (audio.currentTime > 0) {
-        return Math.min(1, Math.max(clampedStart, audio.currentTime / duration));
-      }
-      return clampedStart;
-    };
-
-    const isNearEnd = () => {
-      const duration = effectiveDuration();
-      return duration > 0 && (audio.ended || audio.currentTime >= duration - 0.08);
+      const progress = Math.max(
+        0,
+        Math.min(1, (audio.currentTime - mediaStart) / playableMedia),
+      );
+      return Math.min(1, clampedStart + (1 - clampedStart) * progress);
     };
 
     const seekToStart = () => {
       if (clampedStart <= 0) {
         return;
       }
-      const duration = effectiveDuration();
-      if (duration > 0) {
-        audio.currentTime = clampedStart * duration;
-        enforceAudioSpeed(audio, { force: true, afterSeek: true });
-        setChunkProgress(chunkIndex, clampedStart);
-      }
-    };
-
-    const scheduleEndWatchdog = () => {
-      window.clearTimeout(endTimer);
-      if (completed) {
-        return;
-      }
-      const duration = effectiveDuration();
-      const speed = Math.max(0.25, playbackSpeed());
-      const remainingMedia = Math.max(0, duration - audio.currentTime);
-      const wallMs = (remainingMedia / speed) * 1000;
-      const ms = Math.max(1500, wallMs + 2500);
-      endTimer = window.setTimeout(() => {
-        if (completed) {
-          return;
-        }
-        if (isNearEnd()) {
-          finishChunk(isPlaybackActive(generation));
-          return;
-        }
-        scheduleEndWatchdog();
-      }, ms);
-    };
-
-    const onPlaying = () => {
-      enforceAudioSpeed(audio, { force: true });
+      audio.currentTime = mediaStart;
+      enforceAudioSpeed(audio, { force: true, afterSeek: true });
+      setChunkProgress(chunkIndex, clampedStart);
     };
 
     const cleanup = () => {
-      window.clearTimeout(endTimer);
       cancelAnimationFrame(rafId);
-      audio.removeEventListener("playing", onPlaying);
       audio.onended = null;
       audio.ontimeupdate = null;
       audio.onerror = null;
@@ -1413,19 +1398,11 @@ async function playBlob(blob, chunkIndex, generation) {
       if (!isPlaybackActive(generation) || currentAudio !== audio) {
         return;
       }
-      enforceAudioSpeed(audio);
       setChunkProgress(chunkIndex, getRatio());
     };
 
     const tick = () => {
-      enforceAudioSpeed(audio, { force: true });
       updateHighlight();
-      if (isNearEnd()) {
-        if (audio.ended) {
-          finishChunk(isPlaybackActive(generation));
-          return;
-        }
-      }
       if (!audio.paused && !audio.ended) {
         rafId = requestAnimationFrame(tick);
       }
@@ -1447,16 +1424,35 @@ async function playBlob(blob, chunkIndex, generation) {
         setChunkProgress(chunkIndex, 1);
         markChunkDone(chunkIndex);
       }
-      resolve(success);
+      resolve(Boolean(success) && isPlaybackActive(generation));
     };
 
-    cancelActiveBlobPlayback = finishChunk;
-    activeBlobTiming = { audio, scheduleEndWatchdog };
-
-    audio.onended = () => {
+    const handleEnded = () => {
+      if (completed) {
+        return;
+      }
+      if (audio.currentTime >= mediaDuration - 0.08) {
+        finishChunk(isPlaybackActive(generation));
+        return;
+      }
+      if (
+        isPlaybackActive(generation) &&
+        !isPaused &&
+        earlyEndRetries < 5 &&
+        audio.currentTime > mediaStart + 0.02
+      ) {
+        earlyEndRetries += 1;
+        enforceAudioSpeed(audio, { force: true });
+        audio.play().catch(() => finishChunk(false));
+        return;
+      }
       finishChunk(isPlaybackActive(generation));
     };
 
+    cancelActiveBlobPlayback = finishChunk;
+    activeBlobTiming = { audio };
+
+    audio.onended = handleEnded;
     audio.onerror = () => {
       if (cancelActiveBlobPlayback === finishChunk) {
         cancelActiveBlobPlayback = null;
@@ -1467,23 +1463,15 @@ async function playBlob(blob, chunkIndex, generation) {
       }
       reject(new Error("Audio playback failed"));
     };
-
-    audio.ontimeupdate = () => {
-      enforceAudioSpeed(audio, { force: true });
-      updateHighlight();
-      if (isNearEnd() && !completed) {
-        scheduleEndWatchdog();
-      }
-    };
-
-    audio.addEventListener("playing", onPlaying);
+    audio.ontimeupdate = updateHighlight;
 
     const beginPlay = () => {
       if (!isPlaybackActive(generation)) {
         finishChunk(false);
         return;
       }
-      applyAudioSpeed(audio);
+      applyPreservesPitch(audio);
+      enforceAudioSpeed(audio, { force: true });
       if (clampedStart > 0) {
         setChunkProgress(chunkIndex, clampedStart);
       } else if (!readingScrollLocked) {
@@ -1498,7 +1486,6 @@ async function playBlob(blob, chunkIndex, generation) {
             return;
           }
           enforceAudioSpeed(audio, { force: true });
-          scheduleEndWatchdog();
           rafId = requestAnimationFrame(tick);
         })
         .catch((error) => {
@@ -1515,31 +1502,17 @@ async function playBlob(blob, chunkIndex, generation) {
       if (playbackPrepared || completed) {
         return;
       }
-      const duration = effectiveDuration();
-      if (duration <= 0) {
-        return;
-      }
       playbackPrepared = true;
+      applyPreservesPitch(audio);
       enforceAudioSpeed(audio, { force: true });
       seekToStart();
       beginPlay();
     };
 
     audio.addEventListener("loadedmetadata", prepareAndPlay, { once: true });
-    audio.addEventListener(
-      "durationchange",
-      () => {
-        if (!playbackPrepared) {
-          prepareAndPlay();
-        }
-      },
-      { once: true },
-    );
-
-    const initialSpeed = playbackSpeed();
-    audio.defaultPlaybackRate = initialSpeed;
-    audio.playbackRate = initialSpeed;
-    audio.preservesPitch = true;
+    applyPreservesPitch(audio);
+    audio.defaultPlaybackRate = playbackSpeed();
+    audio.playbackRate = playbackSpeed();
     audio.src = url;
     if (audio.readyState >= HTMLMediaElement.HAVE_METADATA) {
       prepareAndPlay();
@@ -1615,10 +1588,6 @@ async function runPlaybackLoop(generation, { skipPositionReset = false } = {}) {
         break;
       }
       throw new Error(`Playback stopped unexpectedly at section ${index + 1}`);
-    }
-
-    if (index + 1 < totalChunks && isPlaybackActive(generation)) {
-      await new Promise((resolve) => window.setTimeout(resolve, 40));
     }
 
     currentChunk = index + 1;

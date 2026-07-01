@@ -15,9 +15,13 @@ DEFAULT_SPEAKER = "Ryan"
 DEFAULT_LANGUAGE = "English"
 SAMPLE_RATE = 24000
 STEADY_READING_INSTRUCT = (
-    "Speak in a calm, steady audiobook narrator voice. "
-    "Keep tone, pace, and emotion consistent throughout. Neutral delivery."
+    "Speak in a calm, neutral audiobook narrator voice. "
+    "Keep tone, pace, pitch, and emotional energy identical across every sentence. "
+    "Do not add excitement, sadness, anger, or emphasis unless the text is a direct quote. "
+    "Read punctuation plainly without dramatic inflection."
 )
+STEADY_READING_TEMPERATURE = 0.5
+STEADY_READING_TOP_P = 0.85
 DEFAULT_TEMPERATURE = 0.65
 DEFAULT_TOP_P = 0.9
 DEFAULT_REPETITION_PENALTY = 1.05
@@ -502,6 +506,21 @@ def download_model(model_id: str) -> None:
         with DOWNLOAD_LOCK:
             DOWNLOAD_STATE[model_id] = {"status": "error", "message": str(exc)}
         raise
+
+
+def steady_chunk_instruct(
+    base: str | None,
+    chunk_index: int,
+    total_chunks: int,
+) -> str | None:
+    if not base:
+        return None
+    if total_chunks <= 1:
+        return base
+    return (
+        f"{base} This is segment {chunk_index + 1} of {total_chunks} in one continuous reading. "
+        "Match the delivery of prior segments exactly; do not shift emotion or energy at boundaries."
+    )
 
 
 def _results_to_audio(results: list) -> tuple[np.ndarray, int]:
