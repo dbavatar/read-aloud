@@ -274,11 +274,21 @@ function resolvePrepareStartOffset({ hadReadingView = false, startChunk = null }
   return getOffsetForChunkIndex(index, getChunkReadRatio(index));
 }
 
+function preferredChunkChars() {
+  const model = selectedModel();
+  // Qwen CustomVoice maps best with moderate chunks: long 600-char clips
+  // amplify highlight drift at 2× and risk end truncation under steady tone.
+  if (model?.family === "qwen" || model?.supports_steady_reading) {
+    return 420;
+  }
+  return 600;
+}
+
 function buildPreparePayload({ startOffset = null } = {}) {
   return {
     text: getReadableText(),
     speaker: voiceSelect.value,
-    chunk_chars: 600,
+    chunk_chars: preferredChunkChars(),
     steady_reading: steadyReadingToggle.checked,
     start_offset: startOffset ?? getPlaybackStartOffset(),
   };
@@ -413,16 +423,13 @@ function getChunkReadRatio(index) {
   }
 
   if (currentAudio && chunkStates[index] === "playing") {
-    const duration = currentAudio._mediaDuration || currentAudio.duration;
-    if (Number.isFinite(duration) && duration > 0) {
-      const start = currentAudio._mediaStart || 0;
-      const playable = Math.max(0, duration - start);
-      if (playable <= 0) {
-        return 1;
-      }
-      const progress = Math.max(0, Math.min(1, (currentAudio.currentTime - start) / playable));
-      const base = currentAudio._startRatio || 0;
-      return Math.min(1, base + (1 - base) * progress);
+    const speechStart = currentAudio._speechStart ?? 0;
+    const speechEnd =
+      currentAudio._speechEnd ?? currentAudio._mediaDuration ?? currentAudio.duration;
+    const speechDuration = Math.max(0, speechEnd - speechStart);
+    if (Number.isFinite(speechDuration) && speechDuration > 0) {
+      const t = Number.isFinite(currentAudio.currentTime) ? currentAudio.currentTime : speechStart;
+      return Math.max(0, Math.min(1, (t - speechStart) / speechDuration));
     }
   }
 
@@ -565,6 +572,12 @@ function applySpeedToCurrentAudio() {
     return;
   }
   enforceAudioSpeed(currentAudio, { force: true });
+  if (typeof activeBlobTiming?.reanchorWallClock === "function") {
+    activeBlobTiming.reanchorWallClock();
+  }
+  if (typeof activeBlobTiming?.scheduleEndWatchdog === "function") {
+    activeBlobTiming.scheduleEndWatchdog();
+  }
 }
 
 function applyPreservesPitch(audio) {
@@ -624,9 +637,83 @@ async function getBlobAudioBuffer(blob) {
   }
 }
 
-async function getBlobDuration(blob) {
+/**
+ * Locate the speech-active window inside a decoded buffer.
+ * Qwen (and similar) WAVs often include lead-in / trail-out silence; mapping
+ * highlight progress over the full file makes the voice run ahead of the cursor.
+ */
+function analyzeSpeechWindow(audioBuffer) {
+  const duration = audioBuffer.duration;
+  if (!Number.isFinite(duration) || duration <= 0) {
+    return { duration: 0, speechStart: 0, speechEnd: 0 };
+  }
+
+  const channel = audioBuffer.numberOfChannels > 0 ? audioBuffer.getChannelData(0) : null;
+  if (!channel || channel.length === 0) {
+    return { duration, speechStart: 0, speechEnd: duration };
+  }
+
+  const sampleRate = audioBuffer.sampleRate || 24000;
+  const win = Math.max(1, Math.floor(sampleRate * 0.02));
+  const frameCount = Math.floor(channel.length / win);
+  if (frameCount <= 0) {
+    return { duration, speechStart: 0, speechEnd: duration };
+  }
+
+  let peak = 0;
+  const rms = new Float32Array(frameCount);
+  for (let frame = 0; frame < frameCount; frame += 1) {
+    const offset = frame * win;
+    let sum = 0;
+    for (let i = 0; i < win; i += 1) {
+      const sample = channel[offset + i];
+      sum += sample * sample;
+    }
+    const value = Math.sqrt(sum / win);
+    rms[frame] = value;
+    if (value > peak) {
+      peak = value;
+    }
+  }
+
+  // Relative to peak, with a small absolute floor so near-silent clips still map.
+  const threshold = Math.max(peak * 0.06, 0.004);
+  let first = 0;
+  let last = frameCount - 1;
+  for (let frame = 0; frame < frameCount; frame += 1) {
+    if (rms[frame] >= threshold) {
+      first = frame;
+      break;
+    }
+  }
+  for (let frame = frameCount - 1; frame >= 0; frame -= 1) {
+    if (rms[frame] >= threshold) {
+      last = frame;
+      break;
+    }
+  }
+
+  // Small pad so the first/last phonemes are not clipped from the map.
+  const pad = 0.04;
+  let speechStart = Math.max(0, (first * win) / sampleRate - pad);
+  let speechEnd = Math.min(duration, ((last + 1) * win) / sampleRate + pad);
+  if (speechEnd - speechStart < duration * 0.2) {
+    // Degenerate detection — fall back to the full clip.
+    speechStart = 0;
+    speechEnd = duration;
+  }
+
+  return { duration, speechStart, speechEnd };
+}
+
+async function getBlobTiming(blob) {
   const audioBuffer = await getBlobAudioBuffer(blob);
-  return audioBuffer.duration;
+  return analyzeSpeechWindow(audioBuffer);
+}
+
+async function getBlobDuration(blob) {
+  const timing = await getBlobTiming(blob);
+  return timing.duration;
 }
 
 function onSpeedControlInput() {
@@ -834,17 +921,48 @@ function setChunkProgress(index, ratio) {
     chunkStates[chunkIndex] = "done";
     chunkElements[chunkIndex].className = "chunk done";
     chunkElements[chunkIndex].innerHTML = escapeHtml(chunkTexts[chunkIndex]);
+    delete chunkElements[chunkIndex].dataset.readChars;
   }
 
-  const readChars = Math.max(
+  // Prefer word boundaries so a slightly drifted ratio does not sit mid-word.
+  let readChars = Math.max(
     0,
     Math.min(text.length, Math.floor(text.length * clampedRatio)),
   );
+  if (clampedRatio > 0 && clampedRatio < 1 && readChars > 0 && readChars < text.length) {
+    const atBoundary =
+      /[\s.,;:!?…"'”)\]]/.test(text[readChars - 1]) || /\s/.test(text[readChars]);
+    if (!atBoundary) {
+      const nextBreak = text.indexOf(" ", readChars);
+      const prevBreak = text.lastIndexOf(" ", readChars - 1);
+      if (nextBreak !== -1 && nextBreak - readChars <= 12) {
+        readChars = nextBreak + 1;
+      } else if (prevBreak !== -1 && readChars - prevBreak <= 12) {
+        readChars = prevBreak + 1;
+      }
+    }
+  }
+  if (clampedRatio >= 0.995) {
+    readChars = text.length;
+  }
+
+  // Skip DOM rewrites when the visible caret has not moved (large Qwen
+  // chunks thrash innerHTML every frame otherwise, which lags the rAF loop).
+  const prevChars = Number(element.dataset.readChars || -1);
+  const nextState = clampedRatio >= 1 ? "done" : "playing";
+  if (prevChars === readChars && chunkStates[index] === nextState) {
+    if (clampedRatio > 0.05) {
+      readingScrollLocked = false;
+    }
+    return;
+  }
+
   const readPart = escapeHtml(text.slice(0, readChars));
   const unreadPart = escapeHtml(text.slice(readChars));
-  chunkStates[index] = clampedRatio >= 1 ? "done" : "playing";
-  applyChunkClasses(element, index, clampedRatio >= 1 ? "done" : "current");
+  chunkStates[index] = nextState;
+  applyChunkClasses(element, index, nextState === "done" ? "done" : "current");
   element.innerHTML = `<span class="read-part">${readPart}</span><span class="unread-part">${unreadPart}</span>`;
+  element.dataset.readChars = String(readChars);
   updateChunkPipeline();
   if (clampedRatio > 0.05) {
     readingScrollLocked = false;
@@ -978,11 +1096,12 @@ function updateModelControls() {
   updatePlaybackControls();
 }
 
-async function loadModels() {
+async function loadModels({ preferSelection = null } = {}) {
   const response = await fetch("/api/models");
   const data = await response.json();
   modelCatalog = data.models || [];
-  const previous = modelSelect.value;
+  const previous = preferSelection || modelSelect.value;
+  const serverSelected = modelCatalog.find((model) => model.selected)?.id || "";
 
   modelSelect.innerHTML = "";
   for (const model of modelCatalog) {
@@ -993,8 +1112,14 @@ async function loadModels() {
     modelSelect.appendChild(option);
   }
 
-  if (previous) {
+  // Keep the user's dropdown choice when browsing/downloading; after an
+  // explicit switch, preferSelection pins the newly loaded model.
+  if (preferSelection && modelCatalog.some((model) => model.id === preferSelection)) {
+    modelSelect.value = preferSelection;
+  } else if (previous && modelCatalog.some((model) => model.id === previous)) {
     modelSelect.value = previous;
+  } else if (serverSelected) {
+    modelSelect.value = serverSelected;
   }
   updateModelControls();
 }
@@ -1038,8 +1163,12 @@ async function selectCurrentModel() {
   if (!model) {
     return;
   }
-  if (model.status !== "ready" && model.status !== "partial") {
-    throw new Error("Download this MLX model before using it.");
+  if (model.status !== "ready") {
+    throw new Error(
+      model.status === "partial"
+        ? "This model is incomplete. Finish the download before using it."
+        : "Download this MLX model before using it.",
+    );
   }
 
   modelWarning.classList.add("hidden");
@@ -1056,7 +1185,12 @@ async function selectCurrentModel() {
       if (!response.ok) {
         throw new Error(data.error || "Could not switch model");
       }
-      await Promise.all([loadModels(), loadModelStatus(), loadVoices()]);
+      // Prefer server selection after a successful switch.
+      await Promise.all([
+        loadModels({ preferSelection: model.id }),
+        loadModelStatus(),
+        loadVoices({ preferVoice: voiceSelect.value }),
+      ]);
       updatePlaybackControls();
       await rebindSessionKeepingPosition(resumeChunk, savedTotalChunks);
     },
@@ -1115,29 +1249,50 @@ function startModelPolling() {
     return;
   }
   statusPollTimer = window.setInterval(async () => {
-    await loadModels();
-    const status = await loadModelStatus();
+    const previousId = modelSelect.value;
+    await loadModels({ preferSelection: previousId });
+    await loadModelStatus();
     const model = selectedModel();
-    if (model && (model.status === "ready" || !status.loading)) {
+    // status.loading is MLX load state, not Hugging Face download progress.
+    // Keep polling until the selected model leaves the downloading state.
+    if (!model || model.status !== "downloading") {
       window.clearInterval(statusPollTimer);
       statusPollTimer = null;
       updateModelControls();
+      if (model?.status === "ready" && !model.selected) {
+        modelWarning.textContent = "Download complete. Click “Use model” to load it.";
+        modelWarning.classList.remove("hidden");
+      } else if (model?.status === "error" || model?.download_message) {
+        if (model.status !== "ready") {
+          modelWarning.textContent = model.download_message || "Download failed.";
+          modelWarning.classList.remove("hidden");
+        }
+      }
     }
   }, 2500);
 }
 
-async function loadVoices() {
+async function loadVoices({ preferVoice = null } = {}) {
+  const previous = preferVoice || voiceSelect.value;
   const response = await fetch("/api/voices");
   const data = await response.json();
+  const voices = data.voices || [];
   voiceSelect.innerHTML = "";
-  for (const voice of data.voices) {
+  let matchedPrevious = false;
+  for (const voice of voices) {
     const option = document.createElement("option");
     option.value = voice.id;
     option.textContent = voice.label;
-    if (voice.default) {
+    if (previous && voice.id === previous) {
+      option.selected = true;
+      matchedPrevious = true;
+    } else if (!matchedPrevious && voice.default) {
       option.selected = true;
     }
     voiceSelect.appendChild(option);
+  }
+  if (matchedPrevious) {
+    voiceSelect.value = previous;
   }
 }
 
@@ -1334,16 +1489,26 @@ async function playBlob(blob, chunkIndex, generation) {
     return false;
   }
 
-  let mediaDuration = 0;
+  let timing;
   try {
-    mediaDuration = await getBlobDuration(blob);
+    timing = await getBlobTiming(blob);
   } catch (_error) {
     throw new Error("Could not decode audio for playback");
   }
 
+  const mediaDuration = timing.duration;
   if (!isPlaybackActive(generation) || mediaDuration <= 0) {
     return false;
   }
+
+  // Map highlight over the speech-active window, not lead/trail silence.
+  // Large Qwen clips otherwise leave the voice well ahead of the cursor.
+  const speechStart = Math.max(0, Math.min(timing.speechStart ?? 0, mediaDuration));
+  const speechEnd = Math.max(
+    speechStart + 0.05,
+    Math.min(timing.speechEnd ?? mediaDuration, mediaDuration),
+  );
+  const speechDuration = Math.max(0.05, speechEnd - speechStart);
 
   const startRatio = getPlaybackStartRatio(chunkIndex);
 
@@ -1354,27 +1519,73 @@ async function playBlob(blob, chunkIndex, generation) {
     let rafId = 0;
     let completed = false;
     let earlyEndRetries = 0;
+    let endTimer = 0;
+    // Wall-clock anchor: (perf ms, estimated media seconds).
+    let wallAnchorPerf = 0;
+    let wallAnchorMedia = 0;
+    let wallAnchored = false;
     const clampedStart = Math.max(0, Math.min(1, startRatio));
-    const mediaStart = clampedStart * mediaDuration;
-    const playableMedia = Math.max(0, mediaDuration - mediaStart);
+    // Media time within the speech window for mid-chunk resume.
+    const mediaStart = speechStart + clampedStart * speechDuration;
+    const nearEndEpsilon = Math.min(0.15, Math.max(0.05, speechDuration * 0.02));
 
     audio._mediaDuration = mediaDuration;
+    audio._speechStart = speechStart;
+    audio._speechEnd = speechEnd;
     audio._mediaStart = mediaStart;
     audio._startRatio = clampedStart;
 
+    const estimatedMediaTime = () => {
+      const reported = Number.isFinite(audio.currentTime) ? audio.currentTime : 0;
+      if (!wallAnchored || audio.paused || isPaused) {
+        return reported;
+      }
+      const speed = Math.max(0.25, playbackSpeed());
+      const wallMedia = wallAnchorMedia + ((performance.now() - wallAnchorPerf) / 1000) * speed;
+      // Browser currentTime often lags at 2–4× on long Qwen clips; DESIGN.md
+      // uses max(currentTime, wallClockElapsed). Cap wall at speechEnd so we
+      // never invent progress past the clip while waiting on trail silence.
+      return Math.max(reported, Math.min(wallMedia, speechEnd));
+    };
+
+    const reanchorWallClock = () => {
+      wallAnchorPerf = performance.now();
+      wallAnchorMedia = Number.isFinite(audio.currentTime) ? audio.currentTime : mediaStart;
+      wallAnchored = true;
+    };
+
     const getRatio = () => {
-      if (playableMedia <= 0) {
+      if (speechDuration <= 0) {
         return 1;
       }
-      const progress = Math.max(
+      const mediaTime = estimatedMediaTime();
+      if (mediaTime <= speechStart) {
+        return clampedStart > 0 ? clampedStart : 0;
+      }
+      if (mediaTime >= speechEnd - nearEndEpsilon * 0.25) {
+        // Close enough to speech end — snap remaining text so we don't
+        // "skip" the tail when the last words land during trail silence.
+        const raw = (mediaTime - speechStart) / speechDuration;
+        return Math.min(1, Math.max(clampedStart, raw));
+      }
+      const progressInSpeech = Math.max(
         0,
-        Math.min(1, (audio.currentTime - mediaStart) / playableMedia),
+        Math.min(1, (mediaTime - speechStart) / speechDuration),
       );
-      return Math.min(1, clampedStart + (1 - clampedStart) * progress);
+      // progressInSpeech is absolute within the speech window (includes start ratio).
+      return Math.min(1, Math.max(clampedStart, progressInSpeech));
+    };
+
+    const isNearEnd = () => {
+      if (audio.ended) {
+        return true;
+      }
+      const mediaTime = estimatedMediaTime();
+      return mediaTime >= speechEnd - nearEndEpsilon || mediaTime >= mediaDuration - nearEndEpsilon;
     };
 
     const seekToStart = () => {
-      if (clampedStart <= 0) {
+      if (clampedStart <= 0 && speechStart <= 0.02) {
         return;
       }
       audio.currentTime = mediaStart;
@@ -1383,10 +1594,12 @@ async function playBlob(blob, chunkIndex, generation) {
     };
 
     const cleanup = () => {
+      window.clearTimeout(endTimer);
       cancelAnimationFrame(rafId);
       audio.onended = null;
       audio.ontimeupdate = null;
       audio.onerror = null;
+      audio.onplaying = null;
       audio.pause();
       URL.revokeObjectURL(url);
       if (activeBlobTiming?.audio === audio) {
@@ -1397,6 +1610,17 @@ async function playBlob(blob, chunkIndex, generation) {
     const updateHighlight = () => {
       if (!isPlaybackActive(generation) || currentAudio !== audio) {
         return;
+      }
+      // When currentTime catches up to the wall estimate, re-sync the anchor
+      // so small rate errors do not accumulate across long Qwen chunks.
+      if (wallAnchored && !audio.paused && !isPaused) {
+        const speed = Math.max(0.25, playbackSpeed());
+        const wallMedia =
+          wallAnchorMedia + ((performance.now() - wallAnchorPerf) / 1000) * speed;
+        const reported = audio.currentTime;
+        if (Number.isFinite(reported) && reported + 0.05 >= wallMedia) {
+          reanchorWallClock();
+        }
       }
       setChunkProgress(chunkIndex, getRatio());
     };
@@ -1427,30 +1651,73 @@ async function playBlob(blob, chunkIndex, generation) {
       resolve(Boolean(success) && isPlaybackActive(generation));
     };
 
+    const scheduleEndWatchdog = () => {
+      window.clearTimeout(endTimer);
+      if (completed || isPaused) {
+        return;
+      }
+      const speed = Math.max(0.25, playbackSpeed());
+      const remainingMedia = Math.max(0, speechEnd - estimatedMediaTime());
+      const wallMs = (remainingMedia / speed) * 1000;
+      // Complete shortly after the speech window should end (don't wait on trail silence).
+      const ms = Math.max(800, wallMs + 600);
+      endTimer = window.setTimeout(() => {
+        if (completed) {
+          return;
+        }
+        if (!isPlaybackActive(generation) || currentAudio !== audio) {
+          finishChunk(false);
+          return;
+        }
+        if (isPaused) {
+          scheduleEndWatchdog();
+          return;
+        }
+        if (isNearEnd() || getRatio() >= 0.97) {
+          finishChunk(isPlaybackActive(generation));
+          return;
+        }
+        // Still mid-chunk with no ended event — try resume once, then re-arm.
+        if (earlyEndRetries < 3 && !audio.paused) {
+          earlyEndRetries += 1;
+          enforceAudioSpeed(audio, { force: true });
+          audio.play().catch(() => {});
+        }
+        scheduleEndWatchdog();
+      }, ms);
+    };
+
     const handleEnded = () => {
       if (completed) {
         return;
       }
-      if (audio.currentTime >= mediaDuration - 0.08) {
+      if (isNearEnd() || getRatio() >= 0.9) {
         finishChunk(isPlaybackActive(generation));
         return;
       }
-      if (
-        isPlaybackActive(generation) &&
-        !isPaused &&
-        earlyEndRetries < 5 &&
-        audio.currentTime > mediaStart + 0.02
-      ) {
+      // Premature ended: retry resume instead of marking the chunk done.
+      if (isPlaybackActive(generation) && !isPaused && earlyEndRetries < 5) {
         earlyEndRetries += 1;
         enforceAudioSpeed(audio, { force: true });
-        audio.play().catch(() => finishChunk(false));
+        audio
+          .play()
+          .then(() => {
+            reanchorWallClock();
+            scheduleEndWatchdog();
+            rafId = requestAnimationFrame(tick);
+          })
+          .catch(() => finishChunk(false));
         return;
       }
-      finishChunk(isPlaybackActive(generation));
+      if (getRatio() >= 0.85) {
+        finishChunk(isPlaybackActive(generation));
+      } else {
+        finishChunk(false);
+      }
     };
 
     cancelActiveBlobPlayback = finishChunk;
-    activeBlobTiming = { audio };
+    activeBlobTiming = { audio, scheduleEndWatchdog, reanchorWallClock };
 
     audio.onended = handleEnded;
     audio.onerror = () => {
@@ -1464,6 +1731,13 @@ async function playBlob(blob, chunkIndex, generation) {
       reject(new Error("Audio playback failed"));
     };
     audio.ontimeupdate = updateHighlight;
+    // Prefer the real "playing" event for wall-clock anchor — play() may
+    // resolve before the first sample is emitted on large first chunks.
+    audio.onplaying = () => {
+      enforceAudioSpeed(audio, { force: true });
+      reanchorWallClock();
+      scheduleEndWatchdog();
+    };
 
     const beginPlay = () => {
       if (!isPlaybackActive(generation)) {
@@ -1486,6 +1760,11 @@ async function playBlob(blob, chunkIndex, generation) {
             return;
           }
           enforceAudioSpeed(audio, { force: true });
+          // Fallback anchor if "playing" already fired or never does.
+          if (!wallAnchored) {
+            reanchorWallClock();
+          }
+          scheduleEndWatchdog();
           rafId = requestAnimationFrame(tick);
         })
         .catch((error) => {
@@ -1630,7 +1909,17 @@ async function beginPlayback({ force = false, skipPositionReset = false } = {}) 
       setButtons({ playing: true, paused: false });
       if (currentAudio) {
         applyAudioSpeed(currentAudio);
-        currentAudio.play().catch(() => {});
+        currentAudio
+          .play()
+          .then(() => {
+            if (typeof activeBlobTiming?.reanchorWallClock === "function") {
+              activeBlobTiming.reanchorWallClock();
+            }
+            if (typeof activeBlobTiming?.scheduleEndWatchdog === "function") {
+              activeBlobTiming.scheduleEndWatchdog();
+            }
+          })
+          .catch(() => {});
       }
     }
     return;
@@ -1711,6 +2000,10 @@ function pausePlayback() {
   isPaused = true;
   setStatus("Paused");
   setButtons({ playing: true, paused: true });
+  // Freeze wall-clock tracking while paused so resume doesn't skip ahead.
+  if (typeof activeBlobTiming?.reanchorWallClock === "function") {
+    activeBlobTiming.reanchorWallClock();
+  }
 }
 
 async function stopPlayback({ statusMessage = "Stopped", resumeChunk = null } = {}) {
@@ -1946,7 +2239,14 @@ modelSelect.addEventListener("change", async () => {
     return;
   }
 
-  if (model.status !== "ready" && model.status !== "partial") {
+  // Not downloaded yet — leave selection so the user can hit Download.
+  if (model.status !== "ready") {
+    modelWarning.classList.add("hidden");
+    if (model.status === "partial") {
+      modelWarning.textContent = "This model is incomplete. Finish the download before using it.";
+      modelWarning.classList.remove("hidden");
+    }
+    modelSelect.dataset.previousModel = modelSelect.value;
     return;
   }
 

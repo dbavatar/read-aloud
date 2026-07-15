@@ -538,6 +538,76 @@ def _results_to_audio(results: list) -> tuple[np.ndarray, int]:
     return np.concatenate(parts), sample_rate
 
 
+def _sentence_segments(text: str, max_chars: int) -> list[str]:
+    """Split long text into sentence-sized pieces for safer Qwen generation.
+
+    mlx-audio caps CustomVoice generation at roughly 6 codec tokens per text
+    token. Slow/steady speech can hit that cap mid-chunk and drop the ending.
+    Shorter segments each get their own budget.
+    """
+    text = (text or "").strip()
+    if not text or len(text) <= max_chars:
+        return [text] if text else []
+
+    parts = re.split(r"(?<=[.!?])(?:\s+|\n+)", text)
+    segments: list[str] = []
+    current = ""
+    for part in parts:
+        piece = part.strip()
+        if not piece:
+            continue
+        candidate = f"{current} {piece}".strip() if current else piece
+        if len(candidate) <= max_chars:
+            current = candidate
+            continue
+        if current:
+            segments.append(current)
+        if len(piece) <= max_chars:
+            current = piece
+            continue
+        # Hard-wrap oversized sentences on word boundaries.
+        words = piece.split()
+        current = ""
+        for word in words:
+            candidate = f"{current} {word}".strip() if current else word
+            if len(candidate) <= max_chars:
+                current = candidate
+            else:
+                if current:
+                    segments.append(current)
+                current = word
+    if current:
+        segments.append(current)
+    return segments or [text]
+
+
+def _synthesize_qwen_segment(
+    model,
+    text: str,
+    speaker: str,
+    language: str,
+    instruct: str | None,
+    *,
+    temperature: float,
+    top_p: float,
+    repetition_penalty: float,
+) -> tuple[np.ndarray, int]:
+    kwargs = {
+        "text": text,
+        "speaker": speaker,
+        "language": language,
+        "temperature": temperature,
+        "top_p": top_p,
+        "repetition_penalty": repetition_penalty,
+        # mlx-audio still applies an internal text-length cap; a high ceiling
+        # avoids the outer min(max_tokens, …) from truncating first.
+        "max_tokens": 8192,
+    }
+    if instruct:
+        kwargs["instruct"] = instruct
+    return _results_to_audio(list(model.generate_custom_voice(**kwargs)))
+
+
 def synthesize_chunk(
     model,
     text: str,
@@ -555,17 +625,48 @@ def synthesize_chunk(
     entry = catalog_entry(model_id) or {}
 
     if family == "qwen":
-        kwargs = {
-            "text": text,
-            "speaker": speaker,
-            "language": language,
-            "temperature": temperature,
-            "top_p": top_p,
-            "repetition_penalty": repetition_penalty,
-        }
-        if instruct:
-            kwargs["instruct"] = instruct
-        return _results_to_audio(list(model.generate_custom_voice(**kwargs)))
+        # Keep segments short enough that slow/steady delivery fits the
+        # library's per-call codec-token budget (see _sentence_segments).
+        segments = _sentence_segments(text, max_chars=280)
+        if len(segments) <= 1:
+            return _synthesize_qwen_segment(
+                model,
+                text,
+                speaker,
+                language,
+                instruct,
+                temperature=temperature,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+            )
+
+        parts: list[np.ndarray] = []
+        sample_rate = SAMPLE_RATE
+        for segment in segments:
+            audio, sample_rate = _synthesize_qwen_segment(
+                model,
+                segment,
+                speaker,
+                language,
+                instruct,
+                temperature=temperature,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+            )
+            if audio.size:
+                parts.append(audio)
+        if not parts:
+            raise RuntimeError("TTS model returned no audio")
+        if len(parts) == 1:
+            return parts[0], sample_rate
+        # Tiny silence between sub-segments avoids clicks at joins.
+        gap = np.zeros(int(sample_rate * 0.05), dtype=np.float32)
+        joined: list[np.ndarray] = []
+        for index, part in enumerate(parts):
+            joined.append(part)
+            if index < len(parts) - 1:
+                joined.append(gap)
+        return np.concatenate(joined), sample_rate
 
     if family == "kokoro":
         lang_code = entry.get("lang_code", "a")

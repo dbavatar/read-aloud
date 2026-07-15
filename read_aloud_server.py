@@ -98,6 +98,8 @@ def synthesis_worker() -> None:
             break
 
         if job.get("type") == "reload":
+            previous_model = MODEL
+            previous_id = ACTIVE_MODEL_ID
             MODEL_READY.clear()
             MODEL_LOADING.set()
             try:
@@ -108,15 +110,24 @@ def synthesis_worker() -> None:
                 job["error"] = None
                 print(f"MLX TTS model ready: {ACTIVE_MODEL_ID}")
             except Exception as exc:
-                MODEL = None
+                # Keep the previous model live so a failed switch does not
+                # leave the daemon permanently unready for playback.
+                if previous_model is not None:
+                    MODEL = previous_model
+                    ACTIVE_MODEL_ID = previous_id
+                    set_current_model(previous_id)
+                    MODEL_READY.set()
+                    print(f"Model load failed; restored {previous_id}: {exc}")
+                else:
+                    MODEL = None
+                    print(f"Model load failed: {exc}")
                 job["error"] = exc
-                print(f"Model load failed: {exc}")
             finally:
                 MODEL_LOADING.clear()
                 job["event"].set()
             continue
 
-        if not MODEL_READY.is_set():
+        if not MODEL_READY.is_set() or MODEL is None:
             job["error"] = RuntimeError("TTS model is not ready")
             job["event"].set()
             continue
@@ -161,7 +172,8 @@ def request_model_reload(model_id: str, blocking: bool = False) -> None:
     }
     SYNTH_QUEUE.put(job)
     if blocking:
-        job["event"].wait(timeout=300)
+        if not job["event"].wait(timeout=300):
+            raise TimeoutError(f"Timed out loading model: {model_id}")
         if job["error"] is not None:
             raise job["error"]
 
@@ -181,10 +193,18 @@ def synthesize_async(
     if session_is_cancelled(session_id):
         raise RuntimeError("Session cancelled")
 
-    if MODEL_LOADING.is_set():
+    if not MODEL_READY.is_set():
+        if MODEL_LOADING.is_set():
+            if not MODEL_READY.wait(timeout=timeout):
+                raise RuntimeError("TTS model is still loading")
+        else:
+            # Fail fast when nothing is loading — avoids 180s hangs after a
+            # failed model switch left the worker unready.
+            raise RuntimeError(
+                "TTS model is not ready. Select a model or restart the server."
+            )
+    elif MODEL_LOADING.is_set():
         raise RuntimeError("TTS model is switching. Try again in a moment.")
-    if not MODEL_READY.wait(timeout=timeout):
-        raise RuntimeError("TTS model is still loading")
 
     if session_is_cancelled(session_id):
         raise RuntimeError("Session cancelled")
@@ -392,38 +412,45 @@ def api_session_status(session_id: str):
 def api_chunk(session_id: str, chunk_index: int):
     with SESSION_LOCK:
         session = SESSIONS.get(session_id)
+        if session is None:
+            return jsonify({"error": "Session not found or expired"}), 404
+        if session.cancelled:
+            return jsonify({"error": "Session cancelled"}), 499
+        if chunk_index < 0 or chunk_index >= len(session.chunks):
+            return jsonify({"error": "Chunk not found"}), 404
 
-    if session is None:
-        return jsonify({"error": "Session not found or expired"}), 404
-    if session.cancelled:
-        return jsonify({"error": "Session cancelled"}), 499
-    if chunk_index < 0 or chunk_index >= len(session.chunks):
-        return jsonify({"error": "Chunk not found"}), 404
+        cached = session.audio_cache.get(chunk_index)
+        if cached is not None:
+            return send_file(
+                io.BytesIO(cached),
+                mimetype="audio/wav",
+                download_name=f"chunk_{chunk_index + 1}.wav",
+            )
 
-    if chunk_index in session.audio_cache:
-        return send_file(
-            io.BytesIO(session.audio_cache[chunk_index]),
-            mimetype="audio/wav",
-            download_name=f"chunk_{chunk_index + 1}.wav",
-        )
-
-    with SESSION_LOCK:
         session.synthesizing_index = chunk_index
+        chunk_text = session.chunks[chunk_index]
+        speaker = session.speaker
+        language = session.language
+        instruct = session.instruct
+        temperature = session.temperature
+        top_p = session.top_p
+        repetition_penalty = session.repetition_penalty
+        total_chunks = len(session.chunks)
 
     try:
         audio, sample_rate = synthesize_async(
-            text=session.chunks[chunk_index],
-            speaker=session.speaker,
-            language=session.language,
+            text=chunk_text,
+            speaker=speaker,
+            language=language,
             instruct=steady_chunk_instruct(
-                session.instruct,
+                instruct,
                 chunk_index,
-                len(session.chunks),
+                total_chunks,
             ),
             session_id=session_id,
-            temperature=session.temperature,
-            top_p=session.top_p,
-            repetition_penalty=session.repetition_penalty,
+            temperature=temperature,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
         )
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
@@ -433,7 +460,16 @@ def api_chunk(session_id: str, chunk_index: int):
                 session.synthesizing_index = None
 
     wav = wav_bytes(audio, sample_rate)
-    session.audio_cache[chunk_index] = wav
+    with SESSION_LOCK:
+        # Re-check cancellation; another request may have filled the cache.
+        if session.cancelled:
+            return jsonify({"error": "Session cancelled"}), 499
+        existing = session.audio_cache.get(chunk_index)
+        if existing is not None:
+            wav = existing
+        else:
+            session.audio_cache[chunk_index] = wav
+
     return send_file(
         io.BytesIO(wav),
         mimetype="audio/wav",
