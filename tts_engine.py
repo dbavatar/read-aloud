@@ -169,6 +169,7 @@ DOWNLOAD_STATE: dict[str, dict[str, str]] = {}
 DOWNLOAD_LOCK = threading.Lock()
 CURRENT_MODEL_ID = DEFAULT_MODEL
 _RUNTIME_CONFIGURED = False
+INIT_JOB_ID = "__init__"
 
 
 def configure_tts_runtime() -> None:
@@ -708,3 +709,103 @@ def chunk_offsets(chunks: list[str], full_text: str) -> list[int]:
         offsets.append(idx)
         cursor = idx + len(chunk)
     return offsets
+
+
+def tts_process_main(job_queue, result_queue, default_model_id: str) -> None:
+    """MLX synthesis loop in a child process so a hung GPU job can be killed."""
+    os.environ["READ_ALOUD_TTS_WORKER"] = "1"
+    configure_tts_runtime()
+    model = None
+    active_id = default_model_id
+    try:
+        set_current_model(active_id)
+        model = load_model(active_id)
+        result_queue.put(
+            {
+                "id": INIT_JOB_ID,
+                "ok": True,
+                "model_id": active_id,
+                "error": None,
+                "memory": get_memory_stats(),
+            }
+        )
+        print(f"MLX TTS model ready: {active_id}", flush=True)
+    except Exception as exc:
+        result_queue.put({"id": INIT_JOB_ID, "ok": False, "model_id": active_id, "error": str(exc)})
+        print(f"Model load failed: {exc}", flush=True)
+        return
+
+    while True:
+        job = job_queue.get()
+        if job is None or job.get("type") == "stop":
+            break
+
+        job_id = job.get("id")
+        try:
+            if job.get("type") == "reload":
+                previous_model = model
+                previous_id = active_id
+                new_id = job["model_id"]
+                try:
+                    set_current_model(new_id)
+                    model = load_model(new_id)
+                    active_id = new_id
+                    result_queue.put(
+                        {
+                            "id": job_id,
+                            "ok": True,
+                            "model_id": active_id,
+                            "error": None,
+                            "memory": get_memory_stats(),
+                        }
+                    )
+                    print(f"MLX TTS model ready: {active_id}", flush=True)
+                except Exception as exc:
+                    if previous_model is not None:
+                        model = previous_model
+                        active_id = previous_id
+                        set_current_model(previous_id)
+                        print(f"Model load failed; restored {previous_id}: {exc}", flush=True)
+                    else:
+                        print(f"Model load failed: {exc}", flush=True)
+                    result_queue.put(
+                        {
+                            "id": job_id,
+                            "ok": False,
+                            "model_id": active_id,
+                            "error": str(exc),
+                        }
+                    )
+                continue
+
+            audio, sample_rate = synthesize_chunk(
+                model=model,
+                text=job["text"],
+                speaker=job["speaker"],
+                language=job["language"],
+                instruct=job.get("instruct"),
+                model_id=active_id,
+                temperature=job.get("temperature", DEFAULT_TEMPERATURE),
+                top_p=job.get("top_p", DEFAULT_TOP_P),
+                repetition_penalty=job.get("repetition_penalty", DEFAULT_REPETITION_PENALTY),
+            )
+            result_queue.put(
+                {
+                    "id": job_id,
+                    "ok": True,
+                    "audio": np.ascontiguousarray(audio, dtype=np.float32),
+                    "sr": int(sample_rate),
+                    "error": None,
+                    "model_id": active_id,
+                    "memory": get_memory_stats(),
+                }
+            )
+        except Exception as exc:
+            result_queue.put(
+                {
+                    "id": job_id,
+                    "ok": False,
+                    "error": str(exc),
+                    "model_id": active_id,
+                }
+            )

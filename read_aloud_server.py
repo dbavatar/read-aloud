@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import multiprocessing as mp
 import queue
 import threading
 import time
@@ -23,6 +24,7 @@ from tts_engine import (
     DEFAULT_REPETITION_PENALTY,
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_P,
+    INIT_JOB_ID,
     READ_ALOUD_VOICE_TYPES,
     STEADY_READING_INSTRUCT,
     STEADY_READING_TEMPERATURE,
@@ -33,26 +35,42 @@ from tts_engine import (
     get_backend_info,
     list_models,
     list_voices,
-    load_model,
     model_download_status,
     configure_tts_runtime,
     resolve_speaker,
     set_current_model,
     steady_chunk_instruct,
-    synthesize_chunk,
+    tts_process_main,
 )
 from build_info import get_build_info
 from url_fetcher import fetch_url
 
 app = Flask(__name__)
 
-MODEL = None
 MODEL_READY = threading.Event()
 MODEL_LOADING = threading.Event()
 ACTIVE_MODEL_ID = DEFAULT_MODEL
-SYNTH_QUEUE: queue.Queue[dict[str, Any] | None] = queue.Queue()
 SESSIONS: dict[str, "ReadSession"] = {}
 SESSION_LOCK = threading.Lock()
+SYNTH_TIMEOUT = 180.0
+MODEL_LOAD_TIMEOUT = 300.0
+MP_CTX = mp.get_context("spawn")
+
+_WORKER_LOCK = threading.Lock()
+_WORKER: "_WorkerHandle | None" = None
+_PENDING_LOCK = threading.Lock()
+_PENDING: dict[str, dict[str, Any]] = {}
+_DISPATCHER_STARTED = threading.Event()
+_WORKER_INIT_ERROR: str | None = None
+_WORKER_MEMORY: dict[str, float | None] = {"active_gb": None, "peak_gb": None}
+
+
+@dataclass
+class _WorkerHandle:
+    process: mp.Process
+    job_queue: Any
+    result_queue: Any
+    started_at: float
 
 
 @dataclass
@@ -69,6 +87,8 @@ class ReadSession:
     cancelled: bool = False
     synthesizing_index: int | None = None
     audio_cache: dict[int, bytes] = field(default_factory=dict)
+    inflight: dict[int, threading.Event] = field(default_factory=dict)
+    inflight_error: dict[int, str] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
 
 
@@ -89,93 +109,224 @@ def cancel_session(session_id: str) -> bool:
         return True
 
 
-def synthesis_worker() -> None:
-    global MODEL, ACTIVE_MODEL_ID
+def _fail_pending(reason: str, *, keep_init: bool = False) -> None:
+    with _PENDING_LOCK:
+        items = list(_PENDING.items())
+        if not keep_init:
+            _PENDING.clear()
+        else:
+            for key, _value in items:
+                if key != INIT_JOB_ID:
+                    _PENDING.pop(key, None)
+    for job_id, rec in items:
+        if keep_init and job_id == INIT_JOB_ID:
+            continue
+        rec["result"] = {"ok": False, "error": reason}
+        rec["event"].set()
 
+
+def _register_pending(job_id: str) -> dict[str, Any]:
+    rec = {"event": threading.Event(), "result": None}
+    with _PENDING_LOCK:
+        _PENDING[job_id] = rec
+    return rec
+
+
+def _pop_pending(job_id: str) -> dict[str, Any] | None:
+    with _PENDING_LOCK:
+        return _PENDING.pop(job_id, None)
+
+
+def _result_dispatcher() -> None:
     while True:
-        job = SYNTH_QUEUE.get()
-        if job is None:
-            break
-
-        if job.get("type") == "reload":
-            previous_model = MODEL
-            previous_id = ACTIVE_MODEL_ID
-            MODEL_READY.clear()
-            MODEL_LOADING.set()
-            try:
-                ACTIVE_MODEL_ID = job["model_id"]
-                set_current_model(ACTIVE_MODEL_ID)
-                MODEL = load_model(ACTIVE_MODEL_ID)
-                MODEL_READY.set()
-                job["error"] = None
-                print(f"MLX TTS model ready: {ACTIVE_MODEL_ID}")
-            except Exception as exc:
-                # Keep the previous model live so a failed switch does not
-                # leave the daemon permanently unready for playback.
-                if previous_model is not None:
-                    MODEL = previous_model
-                    ACTIVE_MODEL_ID = previous_id
-                    set_current_model(previous_id)
-                    MODEL_READY.set()
-                    print(f"Model load failed; restored {previous_id}: {exc}")
-                else:
-                    MODEL = None
-                    print(f"Model load failed: {exc}")
-                job["error"] = exc
-            finally:
-                MODEL_LOADING.clear()
-                job["event"].set()
+        handle = _WORKER
+        if handle is None:
+            time.sleep(0.05)
             continue
-
-        if not MODEL_READY.is_set() or MODEL is None:
-            job["error"] = RuntimeError("TTS model is not ready")
-            job["event"].set()
-            continue
-
-        if session_is_cancelled(job.get("session_id")):
-            job["error"] = RuntimeError("Session cancelled")
-            job["event"].set()
-            continue
-
         try:
-            audio, sample_rate = synthesize_chunk(
-                model=MODEL,
-                text=job["text"],
-                speaker=job["speaker"],
-                language=job["language"],
-                instruct=job.get("instruct"),
-                model_id=ACTIVE_MODEL_ID,
-                temperature=job.get("temperature", DEFAULT_TEMPERATURE),
-                top_p=job.get("top_p", DEFAULT_TOP_P),
-                repetition_penalty=job.get("repetition_penalty", DEFAULT_REPETITION_PENALTY),
-            )
-            job["result"] = (audio, sample_rate)
+            result = handle.result_queue.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        except (OSError, EOFError, ValueError, BrokenPipeError):
+            time.sleep(0.1)
+            continue
+        if not isinstance(result, dict):
+            continue
+        rec = _pop_pending(str(result.get("id")))
+        if rec is None:
+            continue
+        rec["result"] = result
+        memory = result.get("memory")
+        if isinstance(memory, dict):
+            _WORKER_MEMORY.update(memory)
+        rec["event"].set()
+
+
+def _worker_monitor() -> None:
+    while True:
+        time.sleep(1.0)
+        handle = _WORKER
+        if handle is None or handle.process.is_alive():
+            continue
+        if MODEL_LOADING.is_set() and time.time() - handle.started_at < 5:
+            continue
+        print("TTS worker process died; restarting", flush=True)
+        try:
+            restart_worker("TTS worker process died")
         except Exception as exc:
-            job["error"] = exc
-        finally:
-            job["event"].set()
+            print(f"Failed to restart TTS worker: {exc}", flush=True)
+
+
+def _start_dispatcher_once() -> None:
+    if _DISPATCHER_STARTED.is_set():
+        return
+    threading.Thread(target=_result_dispatcher, name="tts-dispatcher", daemon=True).start()
+    threading.Thread(target=_worker_monitor, name="tts-monitor", daemon=True).start()
+    _DISPATCHER_STARTED.set()
+
+
+def _spawn_worker_locked() -> tuple["_WorkerHandle", dict[str, Any]]:
+    global _WORKER, _WORKER_INIT_ERROR, ACTIVE_MODEL_ID
+
+    job_queue = MP_CTX.Queue()
+    result_queue = MP_CTX.Queue()
+    process = MP_CTX.Process(
+        target=tts_process_main,
+        args=(job_queue, result_queue, ACTIVE_MODEL_ID),
+        daemon=True,
+        name="tts-worker",
+    )
+    handle = _WorkerHandle(
+        process=process,
+        job_queue=job_queue,
+        result_queue=result_queue,
+        started_at=time.time(),
+    )
+    _WORKER_INIT_ERROR = None
+    MODEL_READY.clear()
+    MODEL_LOADING.set()
+    rec = _register_pending(INIT_JOB_ID)
+    process.start()
+    _WORKER = handle
+    return handle, rec
+
+
+def _await_worker_ready(rec: dict[str, Any], timeout: float = MODEL_LOAD_TIMEOUT) -> None:
+    global _WORKER_INIT_ERROR, ACTIVE_MODEL_ID
+
+    if not rec["event"].wait(timeout=timeout):
+        _pop_pending(INIT_JOB_ID)
+        raise TimeoutError("Timed out loading TTS model")
+    result = rec["result"] or {}
+    if not result.get("ok"):
+        _WORKER_INIT_ERROR = str(result.get("error") or "TTS model failed to load")
+        MODEL_LOADING.clear()
+        raise RuntimeError(_WORKER_INIT_ERROR)
+    model_id = result.get("model_id") or ACTIVE_MODEL_ID
+    ACTIVE_MODEL_ID = model_id
+    set_current_model(model_id)
+    MODEL_LOADING.clear()
+    MODEL_READY.set()
+
+
+def _terminate_handle(handle: _WorkerHandle | None) -> None:
+    if handle is None:
+        return
+    process = handle.process
+    if not process.is_alive():
+        return
+    process.terminate()
+    process.join(timeout=2)
+    if process.is_alive():
+        process.kill()
+        process.join(timeout=1)
+
+
+def restart_worker(reason: str) -> None:
+    print(f"Restarting TTS worker: {reason}", flush=True)
+    with _WORKER_LOCK:
+        handle = _WORKER
+        recently_started = handle is not None and time.time() - handle.started_at < 8
+        if recently_started and handle.process.is_alive() and MODEL_LOADING.is_set():
+            return
+        _fail_pending(reason, keep_init=False)
+        _terminate_handle(handle)
+        _handle, rec = _spawn_worker_locked()
+    def _ready() -> None:
+        try:
+            _await_worker_ready(rec)
+        except Exception as exc:
+            print(f"TTS worker failed to become ready: {exc}", flush=True)
+
+    threading.Thread(target=_ready, name="tts-reload", daemon=True).start()
 
 
 def start_synthesis_worker() -> None:
     configure_tts_runtime()
-    thread = threading.Thread(target=synthesis_worker, daemon=True)
-    thread.start()
-    request_model_reload(DEFAULT_MODEL, blocking=True)
+    _start_dispatcher_once()
+    with _WORKER_LOCK:
+        _handle, rec = _spawn_worker_locked()
+    _await_worker_ready(rec)
 
 
 def request_model_reload(model_id: str, blocking: bool = False) -> None:
-    job = {
-        "type": "reload",
-        "model_id": model_id,
-        "event": threading.Event(),
-        "error": None,
-    }
-    SYNTH_QUEUE.put(job)
-    if blocking:
-        if not job["event"].wait(timeout=300):
-            raise TimeoutError(f"Timed out loading model: {model_id}")
-        if job["error"] is not None:
-            raise job["error"]
+    global ACTIVE_MODEL_ID
+
+    if not MODEL_READY.is_set():
+        if MODEL_LOADING.is_set():
+            if not MODEL_READY.wait(timeout=MODEL_LOAD_TIMEOUT):
+                raise RuntimeError("TTS model is still loading")
+        else:
+            raise RuntimeError("TTS model is not ready. Select a model or restart the server.")
+
+    job_id = str(uuid.uuid4())
+    rec = _register_pending(job_id)
+    MODEL_READY.clear()
+    MODEL_LOADING.set()
+    handle = _WORKER
+    if handle is None or not handle.process.is_alive():
+        _pop_pending(job_id)
+        rec["event"].set()
+        restart_worker("TTS worker missing during model reload")
+        if blocking:
+            if not MODEL_READY.wait(timeout=MODEL_LOAD_TIMEOUT):
+                raise TimeoutError(f"Timed out loading model: {model_id}")
+            if ACTIVE_MODEL_ID != model_id:
+                request_model_reload(model_id, blocking=True)
+        return
+
+    handle.job_queue.put({"id": job_id, "type": "reload", "model_id": model_id})
+    if not blocking:
+        def _finish() -> None:
+            global ACTIVE_MODEL_ID
+            try:
+                if not rec["event"].wait(timeout=MODEL_LOAD_TIMEOUT):
+                    restart_worker(f"Timed out loading model: {model_id}")
+                    return
+                result = rec["result"] or {}
+                if result.get("ok"):
+                    loaded = result.get("model_id") or model_id
+                    ACTIVE_MODEL_ID = loaded
+                    set_current_model(loaded)
+                MODEL_LOADING.clear()
+                MODEL_READY.set()
+            except Exception as exc:
+                print(f"Model reload waiter failed: {exc}", flush=True)
+
+        threading.Thread(target=_finish, name="tts-reload-wait", daemon=True).start()
+        return
+
+    if not rec["event"].wait(timeout=MODEL_LOAD_TIMEOUT):
+        restart_worker(f"Timed out loading model: {model_id}")
+        raise TimeoutError(f"Timed out loading model: {model_id}")
+    result = rec["result"] or {}
+    MODEL_LOADING.clear()
+    MODEL_READY.set()
+    if not result.get("ok"):
+        raise RuntimeError(str(result.get("error") or f"Failed to load {model_id}"))
+    loaded = result.get("model_id") or model_id
+    ACTIVE_MODEL_ID = loaded
+    set_current_model(loaded)
 
 
 def synthesize_async(
@@ -188,7 +339,7 @@ def synthesize_async(
     temperature: float = DEFAULT_TEMPERATURE,
     top_p: float = DEFAULT_TOP_P,
     repetition_penalty: float = DEFAULT_REPETITION_PENALTY,
-    timeout: float = 180.0,
+    timeout: float = SYNTH_TIMEOUT,
 ) -> tuple[np.ndarray, int]:
     if session_is_cancelled(session_id):
         raise RuntimeError("Session cancelled")
@@ -198,8 +349,6 @@ def synthesize_async(
             if not MODEL_READY.wait(timeout=timeout):
                 raise RuntimeError("TTS model is still loading")
         else:
-            # Fail fast when nothing is loading — avoids 180s hangs after a
-            # failed model switch left the worker unready.
             raise RuntimeError(
                 "TTS model is not ready. Select a model or restart the server."
             )
@@ -209,25 +358,44 @@ def synthesize_async(
     if session_is_cancelled(session_id):
         raise RuntimeError("Session cancelled")
 
-    job = {
-        "text": text,
-        "speaker": speaker,
-        "language": language,
-        "instruct": instruct,
-        "session_id": session_id,
-        "temperature": temperature,
-        "top_p": top_p,
-        "repetition_penalty": repetition_penalty,
-        "event": threading.Event(),
-        "result": None,
-        "error": None,
-    }
-    SYNTH_QUEUE.put(job)
-    if not job["event"].wait(timeout=timeout):
-        raise RuntimeError("Speech synthesis timed out")
-    if job["error"] is not None:
-        raise job["error"]
-    return job["result"]
+    handle = _WORKER
+    if handle is None or not handle.process.is_alive():
+        restart_worker("TTS worker is not running")
+        raise RuntimeError("TTS engine restarted. Press Play again.")
+
+    job_id = str(uuid.uuid4())
+    rec = _register_pending(job_id)
+    handle.job_queue.put(
+        {
+            "id": job_id,
+            "type": "synth",
+            "text": text,
+            "speaker": speaker,
+            "language": language,
+            "instruct": instruct,
+            "temperature": temperature,
+            "top_p": top_p,
+            "repetition_penalty": repetition_penalty,
+        }
+    )
+    if not rec["event"].wait(timeout=timeout):
+        still_waiting = False
+        with _PENDING_LOCK:
+            still_waiting = _PENDING.get(job_id) is rec and rec["result"] is None
+        if still_waiting:
+            restart_worker("Speech synthesis timed out")
+            raise RuntimeError(
+                "Speech synthesis timed out. TTS engine restarted; press Play again."
+            )
+        rec["event"].wait(timeout=1)
+    result = rec["result"] or {}
+    if not result.get("ok"):
+        raise RuntimeError(str(result.get("error") or "Speech synthesis failed"))
+    audio = result.get("audio")
+    sample_rate = result.get("sr")
+    if audio is None or sample_rate is None:
+        raise RuntimeError("Speech synthesis returned no audio")
+    return audio, int(sample_rate)
 
 
 def session_ttl_cleanup_locked() -> None:
@@ -245,6 +413,14 @@ def wav_bytes(audio: np.ndarray, sample_rate: int) -> bytes:
     return buffer.read()
 
 
+def wav_response(wav: bytes, chunk_index: int):
+    return send_file(
+        io.BytesIO(wav),
+        mimetype="audio/wav",
+        download_name=f"chunk_{chunk_index + 1}.wav",
+    )
+
+
 @app.get("/")
 def index():
     return render_template("index.html", build=get_build_info())
@@ -256,6 +432,9 @@ def status():
     payload["ready"] = MODEL_READY.is_set() and not MODEL_LOADING.is_set()
     payload["loading"] = MODEL_LOADING.is_set()
     payload["build"] = get_build_info()
+    if _WORKER_MEMORY.get("active_gb") is not None:
+        payload["memory_active_gb"] = _WORKER_MEMORY.get("active_gb")
+        payload["memory_peak_gb"] = _WORKER_MEMORY.get("peak_gb")
     return jsonify(payload)
 
 
@@ -410,6 +589,18 @@ def api_session_status(session_id: str):
 
 @app.get("/api/chunk/<session_id>/<int:chunk_index>")
 def api_chunk(session_id: str, chunk_index: int):
+    owner = False
+    wait_event: threading.Event | None = None
+    cached: bytes | None = None
+    chunk_text = ""
+    speaker = ""
+    language = "English"
+    instruct: str | None = None
+    temperature = DEFAULT_TEMPERATURE
+    top_p = DEFAULT_TOP_P
+    repetition_penalty = DEFAULT_REPETITION_PENALTY
+    total_chunks = 0
+
     with SESSION_LOCK:
         session = SESSIONS.get(session_id)
         if session is None:
@@ -420,22 +611,39 @@ def api_chunk(session_id: str, chunk_index: int):
             return jsonify({"error": "Chunk not found"}), 404
 
         cached = session.audio_cache.get(chunk_index)
-        if cached is not None:
-            return send_file(
-                io.BytesIO(cached),
-                mimetype="audio/wav",
-                download_name=f"chunk_{chunk_index + 1}.wav",
-            )
+        if cached is None:
+            wait_event = session.inflight.get(chunk_index)
+            if wait_event is None:
+                wait_event = threading.Event()
+                session.inflight[chunk_index] = wait_event
+                session.inflight_error.pop(chunk_index, None)
+                session.synthesizing_index = chunk_index
+                owner = True
+                chunk_text = session.chunks[chunk_index]
+                speaker = session.speaker
+                language = session.language
+                instruct = session.instruct
+                temperature = session.temperature
+                top_p = session.top_p
+                repetition_penalty = session.repetition_penalty
+                total_chunks = len(session.chunks)
 
-        session.synthesizing_index = chunk_index
-        chunk_text = session.chunks[chunk_index]
-        speaker = session.speaker
-        language = session.language
-        instruct = session.instruct
-        temperature = session.temperature
-        top_p = session.top_p
-        repetition_penalty = session.repetition_penalty
-        total_chunks = len(session.chunks)
+    if cached is not None:
+        return wav_response(cached, chunk_index)
+
+    assert wait_event is not None
+    if not owner:
+        if not wait_event.wait(timeout=SYNTH_TIMEOUT + 15):
+            return jsonify({"error": "Speech synthesis timed out"}), 500
+        with SESSION_LOCK:
+            cached = session.audio_cache.get(chunk_index)
+            err = session.inflight_error.get(chunk_index)
+            cancelled = session.cancelled
+        if cancelled:
+            return jsonify({"error": "Session cancelled"}), 499
+        if cached is not None:
+            return wav_response(cached, chunk_index)
+        return jsonify({"error": err or "Speech synthesis failed"}), 500
 
     try:
         audio, sample_rate = synthesize_async(
@@ -452,29 +660,23 @@ def api_chunk(session_id: str, chunk_index: int):
             top_p=top_p,
             repetition_penalty=repetition_penalty,
         )
+        wav = wav_bytes(audio, sample_rate)
+        with SESSION_LOCK:
+            if session.cancelled:
+                return jsonify({"error": "Session cancelled"}), 499
+            session.audio_cache.setdefault(chunk_index, wav)
+            wav = session.audio_cache[chunk_index]
+        return wav_response(wav, chunk_index)
     except Exception as exc:
+        with SESSION_LOCK:
+            session.inflight_error[chunk_index] = str(exc)
         return jsonify({"error": str(exc)}), 500
     finally:
         with SESSION_LOCK:
+            session.inflight.pop(chunk_index, None)
             if session.synthesizing_index == chunk_index:
                 session.synthesizing_index = None
-
-    wav = wav_bytes(audio, sample_rate)
-    with SESSION_LOCK:
-        # Re-check cancellation; another request may have filled the cache.
-        if session.cancelled:
-            return jsonify({"error": "Session cancelled"}), 499
-        existing = session.audio_cache.get(chunk_index)
-        if existing is not None:
-            wav = existing
-        else:
-            session.audio_cache[chunk_index] = wav
-
-    return send_file(
-        io.BytesIO(wav),
-        mimetype="audio/wav",
-        download_name=f"chunk_{chunk_index + 1}.wav",
-    )
+        wait_event.set()
 
 
 def main() -> int:

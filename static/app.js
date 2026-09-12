@@ -55,7 +55,8 @@ let lastScrollAt = 0;
 const SPEED_STORAGE_KEY = "readAloud.playbackSpeed";
 const MIN_PLAYBACK_SPEED = 0.5;
 const MAX_PLAYBACK_SPEED = 4;
-let preferredPlaybackSpeed = 2;
+const DEFAULT_PLAYBACK_SPEED = 2;
+let preferredPlaybackSpeed = DEFAULT_PLAYBACK_SPEED;
 let pendingReswitchChunk = null;
 let pendingResumeRatio = 0;
 let readingScrollLocked = false;
@@ -153,37 +154,47 @@ async function reswitchPlayback({
     currentChunk = clampChunkIndex(resumeChunk);
     await applyChange({ resumeChunk, savedTotalChunks, currentChunk });
 
-    syncChunkSessionState(savedTotalChunks);
-    showReadingMode();
-    restoreReadingScroll(scrollTop);
-    if (pendingResumeRatio > 0) {
-      setChunkProgress(resumeChunk, pendingResumeRatio);
-    }
-    updateSidebarIndicators();
+    if (savedTotalChunks > 0) {
+      syncChunkSessionState(savedTotalChunks);
+      showReadingMode();
+      restoreReadingScroll(scrollTop);
+      if (pendingResumeRatio > 0) {
+        setChunkProgress(resumeChunk, pendingResumeRatio);
+      }
+      updateSidebarIndicators();
 
-    if (savedTotalChunks > 0 && shouldResume) {
-      readingScrollLocked = false;
-      const resumeRatio = pendingResumeRatio;
+      if (shouldResume) {
+        readingScrollLocked = false;
+        const resumeRatio = pendingResumeRatio;
+        endPlaybackReswitch();
+        pendingResumeRatio = resumeRatio;
+        setStatus(`Resuming section ${currentChunk + 1} with new ${kind}…`);
+        void beginPlayback({ force: true, skipPositionReset: true });
+        return;
+      }
+
       endPlaybackReswitch();
-      pendingResumeRatio = resumeRatio;
-      setStatus(`Resuming section ${currentChunk + 1} with new ${kind}…`);
-      void beginPlayback({ force: true, skipPositionReset: true });
+      setStatus(`Ready — press Play to continue from section ${currentChunk + 1}`);
       return;
     }
 
     endPlaybackReswitch();
-    if (savedTotalChunks > 0) {
-      setStatus(`Ready — press Play to continue from section ${currentChunk + 1}`);
-    } else {
-      setStatus("Ready");
-    }
+    showEditMode();
+    updateSidebarIndicators();
+    setStatus("Ready");
   } catch (error) {
     currentChunk = clampChunkIndex(resumeChunk);
-    syncChunkSessionState(savedTotalChunks);
-    showReadingMode();
-    restoreReadingScroll(scrollTop);
-    updateSidebarIndicators();
-    endPlaybackReswitch();
+    if (savedTotalChunks > 0) {
+      syncChunkSessionState(savedTotalChunks);
+      showReadingMode();
+      restoreReadingScroll(scrollTop);
+      updateSidebarIndicators();
+      endPlaybackReswitch();
+    } else {
+      endPlaybackReswitch();
+      showEditMode();
+      updateSidebarIndicators();
+    }
     throw error;
   } finally {
     if (disablePlayBtn) {
@@ -247,12 +258,33 @@ function prepareText(value) {
   return text.trim();
 }
 
-function getPlaybackStartOffset() {
+function cursorOffsetFromSelection() {
   const raw = textInput.value;
   const selection = textInput.selectionStart ?? 0;
   const preparedBefore = prepareText(raw.slice(0, selection));
   const preparedFull = prepareText(raw);
   return Math.min(preparedBefore.length, preparedFull.length);
+}
+
+function getPlaybackStartOffset() {
+  const preparedFull = prepareText(textInput.value);
+  return Math.min(Math.max(0, startOffset), preparedFull.length);
+}
+
+function resetPlaybackStartToBeginning() {
+  startOffset = 0;
+  try {
+    textInput.setSelectionRange(0, 0);
+  } catch (_error) {
+    // Hidden textareas can throw in some browsers.
+  }
+  textInput.scrollTop = 0;
+}
+
+function setReadableText(text) {
+  textInput.value = text;
+  resetPlaybackStartToBeginning();
+  updateTextMeta();
 }
 
 function getOffsetForChunkIndex(chunkIndex, ratio = 0) {
@@ -339,7 +371,7 @@ async function cancelServerSession(activeSessionId) {
 }
 
 function getCursorOffsetInTrimmedText() {
-  return getPlaybackStartOffset();
+  return cursorOffsetFromSelection();
 }
 
 function findChunkIndexForOffset(offset) {
@@ -532,8 +564,8 @@ async function jumpToChunk(index) {
 
 function clampPlaybackSpeed(speed) {
   const value = Number(speed);
-  if (!Number.isFinite(value)) {
-    return preferredPlaybackSpeed;
+  if (!Number.isFinite(value) || value <= 0) {
+    return DEFAULT_PLAYBACK_SPEED;
   }
   return Math.min(MAX_PLAYBACK_SPEED, Math.max(MIN_PLAYBACK_SPEED, value));
 }
@@ -543,11 +575,15 @@ function playbackSpeed() {
 }
 
 function loadStoredPlaybackSpeed() {
-  const stored = Number(localStorage.getItem(SPEED_STORAGE_KEY));
-  if (Number.isFinite(stored)) {
-    return clampPlaybackSpeed(stored);
+  const raw = localStorage.getItem(SPEED_STORAGE_KEY);
+  if (raw == null || String(raw).trim() === "") {
+    return DEFAULT_PLAYBACK_SPEED;
   }
-  return clampPlaybackSpeed(speedSlider.value);
+  const stored = Number(raw);
+  if (!Number.isFinite(stored) || stored <= 0) {
+    return DEFAULT_PLAYBACK_SPEED;
+  }
+  return clampPlaybackSpeed(stored);
 }
 
 function persistPlaybackSpeed(speed) {
@@ -1158,6 +1194,24 @@ async function loadModelStatus() {
   return data;
 }
 
+async function loadSelectedModel(model) {
+  const response = await fetch("/api/models/select", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model_id: model.id }),
+  });
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data.error || "Could not switch model");
+  }
+  await Promise.all([
+    loadModels({ preferSelection: model.id }),
+    loadModelStatus(),
+    loadVoices({ preferVoice: voiceSelect.value }),
+  ]);
+  updatePlaybackControls();
+}
+
 async function selectCurrentModel() {
   const model = selectedModel();
   if (!model) {
@@ -1172,26 +1226,24 @@ async function selectCurrentModel() {
   }
 
   modelWarning.classList.add("hidden");
+
+  if (!hasActiveReadingSession()) {
+    playBtn.disabled = true;
+    setStatus("Switching model…");
+    try {
+      await loadSelectedModel(model);
+      setStatus("Ready");
+    } finally {
+      playBtn.disabled = false;
+    }
+    return;
+  }
+
   await reswitchPlayback({
     kind: "model",
     disablePlayBtn: true,
     applyChange: async ({ resumeChunk, savedTotalChunks }) => {
-      const response = await fetch("/api/models/select", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model_id: model.id }),
-      });
-      const data = await response.json();
-      if (!response.ok) {
-        throw new Error(data.error || "Could not switch model");
-      }
-      // Prefer server selection after a successful switch.
-      await Promise.all([
-        loadModels({ preferSelection: model.id }),
-        loadModelStatus(),
-        loadVoices({ preferVoice: voiceSelect.value }),
-      ]);
-      updatePlaybackControls();
+      await loadSelectedModel(model);
       await rebindSessionKeepingPosition(resumeChunk, savedTotalChunks);
     },
   });
@@ -1323,9 +1375,8 @@ async function fetchUrl() {
       : data.source_url || "Fetched";
 
     if (data.text) {
-      textInput.value = data.text;
-      updateTextMeta();
       resetSession();
+      setReadableText(data.text);
     }
 
     if (data.warning) {
@@ -1350,9 +1401,8 @@ async function pasteClipboard() {
   try {
     const text = await navigator.clipboard.readText();
     if (text) {
-      textInput.value = text;
-      updateTextMeta();
       resetSession();
+      setReadableText(text);
       setStatus("Pasted from clipboard");
     }
   } catch (error) {
@@ -1445,6 +1495,7 @@ async function fetchChunkBlob(index, generation) {
 
   const controller = new AbortController();
   fetchAbortController = controller;
+  const timeoutId = window.setTimeout(() => controller.abort(), 195000);
 
   try {
     const response = await fetch(`/api/chunk/${sessionId}/${index}`, {
@@ -1470,7 +1521,13 @@ async function fetchChunkBlob(index, generation) {
       setChunkState(index, "ready");
     }
     return blob;
+  } catch (error) {
+    if (error.name === "AbortError" && isPlaybackActive(generation)) {
+      throw new Error("Speech synthesis timed out. Press Play again.");
+    }
+    throw error;
   } finally {
+    window.clearTimeout(timeoutId);
     if (fetchAbortController === controller) {
       fetchAbortController = null;
     }
@@ -1955,7 +2012,7 @@ async function beginPlayback({ force = false, skipPositionReset = false } = {}) 
     setStatus("Playback failed");
     fetchWarning.textContent =
       error.name === "AbortError"
-        ? "Preparing timed out. Try again or restart the server."
+        ? error.message || "Request timed out. Try again or restart the server."
         : error.message;
     fetchWarning.classList.remove("hidden");
     showReadingMode();
@@ -2168,8 +2225,15 @@ editModeBtn.addEventListener("click", async () => {
   updateTextMeta();
   showEditMode();
 });
-textInput.addEventListener("input", () => {
+textInput.addEventListener("input", (event) => {
   resetSession();
+  if (
+    event.inputType === "insertFromPaste" ||
+    event.inputType === "insertFromDrop" ||
+    event.inputType === "insertReplacementText"
+  ) {
+    resetPlaybackStartToBeginning();
+  }
   updateTextMeta();
 });
 textInput.addEventListener("click", rememberCursorStart);
